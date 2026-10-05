@@ -804,6 +804,7 @@ class ImportTokenItem(BaseModel):
     proxy_url: Optional[str] = Field(default=None, max_length=4096)
     auto_refresh_enabled: bool = True
     refresh_interval_minutes: int = Field(default=120, ge=1, le=10080)
+    adspower_serial: Optional[int] = Field(default=None, ge=0, le=1000000)
 
     @field_validator("login_account")
     @classmethod
@@ -1468,6 +1469,7 @@ async def import_tokens(
                         proxy_url=item.proxy_url,
                         auto_refresh_enabled=item.auto_refresh_enabled,
                         refresh_interval_minutes=item.refresh_interval_minutes,
+                        adspower_serial=item.adspower_serial,
                     )
                     should_enable = item.is_active and not is_expired
                     if should_enable:
@@ -1507,6 +1509,7 @@ async def import_tokens(
                         proxy_url=item.proxy_url,
                         auto_refresh_enabled=item.auto_refresh_enabled,
                         refresh_interval_minutes=item.refresh_interval_minutes,
+                        adspower_serial=item.adspower_serial,
                     )
                     should_enable = item.is_active and not is_expired
                     if not should_enable:

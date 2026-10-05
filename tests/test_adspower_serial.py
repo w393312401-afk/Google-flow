@@ -96,6 +96,39 @@ class AdsPowerSerialTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValidationError):
             admin.AdsPowerSerialRequest(adspower_serial=-3)
 
+    async def test_import_carries_the_serial_for_new_and_existing_accounts(self):
+        calls = []
+        known = [SimpleNamespace(id=n, email=f'old{n}@example.test', login_account=f'old{n}@example.test',
+                                 is_active=True) for n in (7, 9)]
+
+        async def add_token(**kwargs):
+            calls.append(('add', kwargs.get('adspower_serial')))
+            return SimpleNamespace(id=8, is_active=True)
+
+        async def update_token(**kwargs):
+            calls.append(('update', kwargs.get('adspower_serial')))
+
+        fake = SimpleNamespace(
+            get_all_tokens=AsyncMock(return_value=known),
+            flow_client=SimpleNamespace(st_to_at=AsyncMock(return_value={'access_token': 'at', 'expires': None})),
+            add_token=add_token, update_token=update_token,
+            enable_token=AsyncMock(), disable_token=AsyncMock(),
+        )
+        items = [
+            admin.ImportTokenItem(login_account='new@example.test', google_cookies='c1', adspower_serial=12),
+            admin.ImportTokenItem(login_account='old7@example.test', google_cookies='c2', adspower_serial=3),
+            admin.ImportTokenItem(login_account='old9@example.test', google_cookies='c3'),
+        ]
+        with patch.object(admin, 'token_manager', fake), patch.object(admin, 'concurrency_manager', None):
+            result = await admin.import_tokens(admin.ImportTokensRequest(tokens=items), token='admin')
+
+        self.assertEqual((result['added'], result['updated'], result['errors']), (1, 2, None))
+        self.assertEqual(calls, [('add', 12), ('update', 3), ('update', None)])
+
+    def test_import_still_rejects_unknown_keys(self):
+        with self.assertRaises(ValidationError):
+            admin.ImportTokenItem(login_account='a@example.test', google_cookies='c', adspower_serial_typo=1)
+
 
 if __name__ == '__main__':
     unittest.main()
