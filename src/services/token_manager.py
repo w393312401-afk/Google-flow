@@ -1561,35 +1561,40 @@ class TokenManager:
 
         Returns:
             credits
+
+        Raises:
+            ValueError: 账号不存在
+            RuntimeError: 账号已禁用，或校验/查询失败；消息为安全的失败类别，
+                不会把失败伪装成余额 0
         """
         token = await self.db.get_token(token_id)
         if not token:
-            return 0
+            raise ValueError("Token不存在")
+        if not token.is_active:
+            raise RuntimeError("account disabled")
 
         # 确保AT有效
-        token = await self.ensure_valid_token(token)
-        if not token:
-            return 0
+        valid = await self.ensure_valid_token(token)
+        if not valid:
+            raise RuntimeError(
+                self.get_last_validation_error(token_id) or "account credentials unavailable"
+            )
 
         try:
-            result = await self.flow_client.get_credits(
-                token.at,
-                google_cookies=token.google_cookies,
-                token_id=token.id,
-            )
-            credits = result.get("credits", 0)
-            user_paygate_tier = result.get("userPaygateTier")
-
-            # 更新数据库
-            await self.db.update_token(
-                token_id,
-                credits=credits,
-                user_paygate_tier=user_paygate_tier,
-            )
-
-            return credits
+            result = await self._get_credits_for_token(valid, valid.at)
         except Exception as e:
+            reason = self._safe_health_error("AT_CHECK", e)
             debug_logger.log_error(
-                f"Failed to refresh credits for token {token_id}: {str(e)}"
+                f"Failed to refresh credits for token {token_id}: {reason}"
             )
-            return 0
+            await self._record_at_failure(token_id, reason, error=e, token=valid)
+            raise RuntimeError(reason) from e
+
+        credits = result.get("credits", 0)
+        await self.db.update_token(
+            token_id,
+            credits=credits,
+            user_paygate_tier=result.get("userPaygateTier"),
+        )
+        await self._persist_health(token_id, None)
+        return credits

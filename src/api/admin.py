@@ -1215,12 +1215,19 @@ async def disable_token(token_id: int, token: str = Depends(verify_admin_token))
 
 @router.post("/api/tokens/{token_id}/refresh-credits")
 async def refresh_credits(token_id: int, token: str = Depends(verify_admin_token)):
-    """刷新Token余额 🆕"""
+    """刷新Token余额 🆕
+
+    失败时返回真实原因，不再把失败显示成余额 0。
+    """
     try:
         credits = await token_manager.refresh_credits(token_id)
         return {"success": True, "message": "余额刷新成功", "credits": credits}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=_translate_health_reason(str(e)))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"刷新余额失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=_truncate_text(e))
 
 
 @router.post("/api/tokens/{token_id}/refresh-at")
@@ -1259,19 +1266,25 @@ async def refresh_at(token_id: int, token: str = Depends(verify_admin_token)):
     )
 
 
-def _describe_refresh_failure(reason: str, disabled: bool) -> str:
-    """把刷新失败的原因类别翻译成可操作的提示，不暴露响应体或 Cookie。"""
+def _translate_health_reason(reason: str, disabled: bool = False) -> str:
+    """把失败原因类别翻译成可操作的提示，不暴露响应体或 Cookie。"""
     if "credentials rejected" in reason:
         message = "Google 登录态已失效（Cookie 被拒绝），请在对应 AdsPower 环境重新登录 Google 后同步 Cookie"
         if disabled:
             message += "；该账号已被自动禁用"
     elif REFRESH_ALL_TRANSIENT_REASON in reason:
-        message = "网络或代理暂时不可用（已自动重试），请稍后再试或检查该账号的代理"
+        message = "网络或代理暂时不可用，请稍后再试或检查该账号的代理"
     elif "traffic restriction" in reason:
         message = "上游流量限制，请稍后再试"
+    elif "account disabled" in reason:
+        message = "账号已禁用，请先启用后再刷新"
     else:
         message = reason or "未知错误"
-    return f"AT刷新失败: {message}"
+    return message
+
+
+def _describe_refresh_failure(reason: str, disabled: bool) -> str:
+    return f"AT刷新失败: {_translate_health_reason(reason, disabled)}"
 
 
 # 代理/网络抖动属于瞬时失败，值得重试；认证失败、上游流量限制等不重试
