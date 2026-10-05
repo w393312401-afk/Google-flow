@@ -289,6 +289,18 @@ class TokenManager:
             debug_logger._format_timestamp(), stage, evidence, reason, decision,
         )
 
+    async def _persist_health(self, token_id: int, reason: Optional[str]) -> None:
+        """持久化最近一次校验失败原因（成功则清除）；诊断写入失败不得影响主流程。"""
+        try:
+            if reason:
+                await self.db.set_token_health(token_id, reason)
+            else:
+                await self.db.clear_token_health(token_id)
+        except Exception as persist_error:
+            debug_logger.log_error(
+                f"[TOKEN_HEALTH] Token {token_id}: 健康状态写入失败: {type(persist_error).__name__}"
+            )
+
     async def _record_at_failure(
         self, token_id: int, reason: str, *, error: Any = None,
         token: Optional[Token] = None,
@@ -296,6 +308,7 @@ class TokenManager:
         self._clear_at_validation_cache(token_id)
         self._last_at_refresh_error[token_id] = reason
         self._last_validation_error[token_id] = reason
+        await self._persist_health(token_id, reason)
         diagnostic = self._health_diagnostic(
             reason.partition(":")[0], error if error is not None else reason
         )
@@ -798,6 +811,9 @@ class TokenManager:
                 self._clear_at_validation_cache(token_id)
                 self._validation_retry_after.pop(token_id, None)
             await self.db.update_token(token_id, **update_fields)
+            if credential_updated:
+                # 凭证刚被更新，旧的失败原因不再适用
+                await self._persist_health(token_id, None)
 
     # ========== AT自动刷新逻辑 (核心) ==========
 
@@ -874,6 +890,7 @@ class TokenManager:
                     credits=credits_result.get("credits", 0),
                     user_paygate_tier=credits_result.get("userPaygateTier"),
                 )
+                await self._persist_health(token.id, None)
                 self._last_at_refresh_error.pop(token.id, None)
                 self._mark_at_valid(token.id, proxy_url=token.proxy_url, token=token)
                 return await self.db.get_token(token.id) or token
@@ -1032,6 +1049,7 @@ class TokenManager:
                     credits=credits_result.get("credits", 0),
                     user_paygate_tier=credits_result.get("userPaygateTier"),
                 )
+                await self._persist_health(token_id, None)
                 self._mark_at_valid(
                     token_id, proxy_url=token.proxy_url if token else None,
                     token=token.model_copy(update={"at": new_at}) if token else None,
@@ -1294,6 +1312,7 @@ class TokenManager:
                 updates["user_paygate_tier"] = credits_result.get("userPaygateTier")
 
                 await self.db.update_token(token_id, **updates)
+                await self._persist_health(token_id, None)
                 self._mark_at_valid(
                     token_id, proxy_url=latest.proxy_url,
                     token=latest.model_copy(update={"st": new_st, "at": new_at}),

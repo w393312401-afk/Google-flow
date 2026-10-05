@@ -1000,6 +1000,10 @@ async def get_tokens(token: str = Depends(verify_admin_token)):
         "name": row.get("name"),
         "remark": row.get("remark"),
         "adspower_serial": row.get("adspower_serial"),
+        "last_health_reason": row.get("last_health_reason") or "",
+        "last_health_at": to_iso(row.get("last_health_at"))
+        if row.get("last_health_at")
+        else None,
         "is_active": bool(row.get("is_active")),
             "created_at": to_iso(row.get("created_at"))
             if row.get("created_at")

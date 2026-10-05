@@ -4,7 +4,7 @@ import asyncio
 import aiosqlite
 import json
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 from .config import DEFAULT_YESCAPTCHA_TASK_TYPE, normalize_yescaptcha_task_type
@@ -802,6 +802,16 @@ class Database:
                 )
             """)
 
+            # Latest failed validation per account. Kept apart from tokens so a failed
+            # check never rewrites an account row (credential writers own that row).
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS token_health (
+                    token_id INTEGER PRIMARY KEY,
+                    reason TEXT NOT NULL DEFAULT '',
+                    checked_at TIMESTAMP
+                )
+            """)
+
             # Tasks table
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS tasks (
@@ -1228,9 +1238,12 @@ class Database:
                     COALESCE(CASE WHEN ts.today_date = ? THEN ts.today_video_count ELSE 0 END, 0) AS today_video_count,
                     COALESCE(CASE WHEN ts.today_date = ? THEN ts.today_error_count ELSE 0 END, 0) AS today_error_count,
                     COALESCE(ts.consecutive_error_count, 0) AS consecutive_error_count,
-                    ts.last_error_at AS last_error_at
+                    ts.last_error_at AS last_error_at,
+                    COALESCE(th.reason, '') AS last_health_reason,
+                    th.checked_at AS last_health_at
                 FROM tokens t
                 LEFT JOIN token_stats ts ON ts.token_id = t.id
+                LEFT JOIN token_health th ON th.token_id = t.id
                 ORDER BY t.created_at DESC
             """,
                 (today, today, today),
@@ -1343,8 +1356,29 @@ class Database:
             )
             await db.execute("DELETE FROM tasks WHERE token_id = ?", (token_id,))
             await db.execute("DELETE FROM token_stats WHERE token_id = ?", (token_id,))
+            await db.execute("DELETE FROM token_health WHERE token_id = ?", (token_id,))
             await db.execute("DELETE FROM projects WHERE token_id = ?", (token_id,))
             await db.execute("DELETE FROM tokens WHERE id = ?", (token_id,))
+            await db.commit()
+
+    async def set_token_health(self, token_id: int, reason: str):
+        """Remember the latest failed validation reason (safe category text only)."""
+        async with self._connect(write=True) as db:
+            await db.execute(
+                """
+                INSERT INTO token_health (token_id, reason, checked_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(token_id) DO UPDATE SET reason = excluded.reason,
+                                                   checked_at = excluded.checked_at
+                """,
+                (token_id, (reason or "")[:200], datetime.now(timezone.utc)),
+            )
+            await db.commit()
+
+    async def clear_token_health(self, token_id: int):
+        """Forget the stored failure after a successful validation or new credentials."""
+        async with self._connect(write=True) as db:
+            await db.execute("DELETE FROM token_health WHERE token_id = ?", (token_id,))
             await db.commit()
 
     # Project operations

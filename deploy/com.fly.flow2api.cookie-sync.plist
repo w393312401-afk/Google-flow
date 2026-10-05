@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Google 账号池 Cookie 同步：每 30 分钟顺序同步一次 AdsPower 账号池到 Flow2API。
+  模板，默认不安装；不依赖 Codex 或其他调度器，也不在 Codex 暂停时停止。
+  只运行已审查的池脚本，不做部署守卫、不重启服务、不触发登录恢复。
+  与 Codex 自动任务 1-google-cookies 同时启用也安全（池锁防止重叠），但没必要。
+
+  安装：
+    cp deploy/com.fly.flow2api.cookie-sync.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fly.flow2api.cookie-sync.plist
+  立即跑一次：launchctl kickstart gui/$(id -u)/com.fly.flow2api.cookie-sync
+  停用：launchctl bootout gui/$(id -u)/com.fly.flow2api.cookie-sync
+  日志：local/cookie-sync.log
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.fly.flow2api.cookie-sync</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/fly/flow2api/.venv/bin/python</string>
+        <string>-u</string>
+        <string>/Users/fly/flow2api/local/sync_adspower_cookie_pool.py</string>
+        <string>--manifest</string>
+        <string>/Users/fly/flow2api/local/adspower-cookie-pool.json</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/fly/flow2api</string>
+    <key>StartInterval</key>
+    <integer>1800</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>NO_PROXY</key>
+        <string>localhost,127.0.0.1,::1</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/Users/fly/flow2api/local/cookie-sync.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/fly/flow2api/local/cookie-sync.log</string>
+</dict>
+</plist>
