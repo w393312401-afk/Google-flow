@@ -6,6 +6,7 @@ import base64
 import json
 import mimetypes
 import re
+from uuid import UUID
 from urllib.parse import urlparse
 
 from curl_cffi.requests import AsyncSession
@@ -31,6 +32,7 @@ from ..core.models import (
 )
 from ..services.generation_handler import MODEL_CONFIG, GenerationHandler
 from ..services.browser_captcha_extension import ExtensionCaptchaService
+from ..services.submission_ledger import SubmissionLedger, request_hash
 
 router = APIRouter()
 
@@ -519,6 +521,7 @@ async def _collect_non_stream_result(
     images: List[bytes],
     base_url_override: Optional[str] = None,
     video_media_id: Optional[str] = None,
+    client_submission_id: Optional[str] = None,
 ) -> str:
     handler = _ensure_generation_handler()
     result = None
@@ -529,7 +532,10 @@ async def _collect_non_stream_result(
         stream=False,
         base_url_override=base_url_override,
         video_media_id=video_media_id,
+        **({'client_submission_id': client_submission_id} if client_submission_id else {}),
     ):
+        if client_submission_id:
+            chunk = json.dumps(await SubmissionLedger(handler.db).capture(client_submission_id, _parse_handler_result(chunk)), ensure_ascii=False)
         result = chunk
 
     if result is None:
@@ -751,6 +757,7 @@ async def _convert_openai_stream_chunk_to_gemini_event(
 async def _iterate_openai_stream(
     normalized: NormalizedGenerationRequest,
     base_url_override: Optional[str] = None,
+    client_submission_id: Optional[str] = None,
 ):
     handler = _ensure_generation_handler()
     async for chunk in handler.handle_generation(
@@ -760,7 +767,12 @@ async def _iterate_openai_stream(
         stream=True,
         base_url_override=base_url_override,
         video_media_id=normalized.video_media_id,
+        **({'client_submission_id': client_submission_id} if client_submission_id else {}),
     ):
+        if client_submission_id:
+            text = chunk[6:].strip() if chunk.startswith('data: ') else chunk
+            if text != '[DONE]':
+                chunk = 'data: ' + json.dumps(await SubmissionLedger(handler.db).capture(client_submission_id, _parse_handler_result(text)), ensure_ascii=False) + '\n\n'
         if chunk.startswith("data: "):
             yield chunk
             continue
@@ -892,10 +904,32 @@ async def create_chat_completion(
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
         request_base_url = _get_request_base_url(raw_request)
+        submission_id = raw_request.headers.get('X-SPARK-Submission-ID') or getattr(request, 'client_submission_id', None)
+        if submission_id:
+            try:
+                submission_id = str(UUID(str(submission_id)))
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail='Invalid client submission UUID')
+            ledger = SubmissionLedger(_ensure_generation_handler().db)
+            created, matches = await ledger.reserve(submission_id, request_hash(normalized.model, normalized.prompt, normalized.images), normalized.model)
+            if not matches:
+                return JSONResponse(status_code=409, content={'error': {
+                    'code': 'submission_identity_conflict', 'message': '提交标识已绑定其他内容',
+                    'client_submission_id': submission_id, 'submission_pending': True,
+                }})
+            if not created:
+                observation = await ledger.observe(submission_id, _ensure_generation_handler())
+                if observation['state'] == 'confirmed' and observation.get('video_url'):
+                    payload = _parse_handler_result(_ensure_generation_handler()._create_completion_response(observation['video_url'], media_type='video'))
+                    payload['submission'] = observation
+                    return JSONResponse(content=payload)
+                error = observation.get('error') or {'code': 'submission_pending', 'message': '原提交尚未确认，请查询原提交'}
+                error = {**error, **{key: value for key, value in observation.items() if key != 'error'}, 'status_code': 409}
+                return JSONResponse(status_code=409, content={'error': error, 'submission': observation})
 
         if request.stream:
             return StreamingResponse(
-                _iterate_openai_stream(normalized, request_base_url),
+                _iterate_openai_stream(normalized, request_base_url, submission_id),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -911,6 +945,7 @@ async def create_chat_completion(
                 normalized.images,
                 base_url_override=request_base_url,
                 video_media_id=normalized.video_media_id,
+                client_submission_id=submission_id,
             )
         )
         return _build_openai_json_response(payload)
@@ -919,6 +954,20 @@ async def create_chat_completion(
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get('/v1/submissions/{client_submission_id}')
+async def get_client_submission(
+    client_submission_id: str,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """Read the original operation; this endpoint cannot submit or retry a job."""
+    try:
+        submission_id = str(UUID(client_submission_id))
+    except ValueError:
+        raise HTTPException(status_code=400, detail='Invalid client submission UUID')
+    handler = _ensure_generation_handler()
+    return await SubmissionLedger(handler.db).observe(submission_id, handler)
 
 
 @router.post("/v1beta/models/{model}:generateContent")

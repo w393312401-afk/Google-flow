@@ -55,6 +55,9 @@ class Token(BaseModel):
     last_st_refresh_at: Optional[datetime] = None
     last_st_refresh_result: str = ""
 
+    # AdsPower 环境序号，仅用于对应本机浏览器环境
+    adspower_serial: Optional[int] = None
+
     # 429禁用相关
     ban_reason: Optional[str] = None  # 禁用原因: "429_rate_limit" 或 None
     banned_at: Optional[datetime] = None  # 禁用时间

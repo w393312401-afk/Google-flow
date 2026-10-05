@@ -1,0 +1,74 @@
+"""AdsPower environment serial shown in the account list."""
+
+import tempfile
+import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import aiosqlite
+from pydantic import ValidationError
+
+from src.api import admin
+from src.core.database import Database
+from src.core.models import Token
+from src.services.flow_client import FlowClient
+from src.services.token_manager import TokenManager
+
+
+class AdsPowerSerialTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.db_path = f'{self.temp_dir.name}/flow.db'
+        self.db = Database(db_path=self.db_path)
+        await self.db.init_db()
+        proxy = SimpleNamespace(normalize_proxy_url=lambda value: value.strip(),
+                                get_request_proxy_url=AsyncMock(return_value=''))
+        self.manager = TokenManager(self.db, FlowClient(proxy_manager=proxy, db=self.db))
+        self.enterContext(patch.object(admin, 'db', self.db))
+
+    async def add(self, email, **overrides):
+        fields = dict(st=f'st-{email}', email=email, login_account=email, google_cookies='cookies')
+        fields.update(overrides)
+        return await self.db.add_token(Token(**fields))
+
+    async def listed(self):
+        return {row['email']: row['adspower_serial'] for row in await admin.get_tokens(token='admin')}
+
+    async def test_serial_is_stored_and_listed(self):
+        await self.add('a@example.test', adspower_serial=63)
+        await self.add('b@example.test')
+
+        self.assertEqual(await self.listed(), {'a@example.test': 63, 'b@example.test': None})
+
+    async def test_update_sets_keeps_and_clears_the_serial(self):
+        token_id = await self.add('a@example.test', adspower_serial=63)
+
+        await self.manager.update_token(token_id, adspower_serial=70)
+        self.assertEqual((await self.listed())['a@example.test'], 70)
+
+        await self.manager.update_token(token_id, remark='note')
+        self.assertEqual((await self.listed())['a@example.test'], 70)
+
+        await self.manager.update_token(token_id, adspower_serial=0)
+        self.assertIsNone((await self.listed())['a@example.test'])
+
+    async def test_existing_database_gains_the_column_on_upgrade(self):
+        async with aiosqlite.connect(self.db_path) as raw:
+            await raw.execute('ALTER TABLE tokens DROP COLUMN adspower_serial')
+            await raw.commit()
+
+        await self.db.check_and_migrate_db()
+
+        async with aiosqlite.connect(self.db_path) as raw:
+            columns = {row[1] for row in await (await raw.execute('PRAGMA table_info(tokens)')).fetchall()}
+        self.assertIn('adspower_serial', columns)
+
+    def test_request_models_reject_negative_serials(self):
+        with self.assertRaises(ValidationError):
+            admin.UpdateTokenRequest(adspower_serial=-1)
+        self.assertIsNone(admin.UpdateTokenRequest().adspower_serial)
+
+
+if __name__ == '__main__':
+    unittest.main()

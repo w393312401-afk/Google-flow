@@ -3,14 +3,36 @@
 import json
 import random
 import re
+import time
 import uuid
+from email.utils import parsedate_to_datetime
+from http.cookies import CookieError, SimpleCookie
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlencode, urlparse
 
 from curl_cffi.requests import AsyncSession
 
 from ..core.logger import debug_logger
-from .browser_cookie_utils import serialize_cookie_header_for_url
+from .browser_cookie_utils import (
+    parse_browser_cookie_payload,
+    serialize_cookie_header_for_url,
+)
+
+
+class FlowRPCRejected(RuntimeError):
+    """An explicit RPC refusal, as distinct from a lost/unknown response."""
+
+    def __init__(self, message, rpc_id, error_code):
+        super().__init__(message)
+        self.rpc_id = rpc_id
+        self.error_code = str(error_code)
+
+    @property
+    def submission_rejected(self):
+        return self.rpc_id in {'YhhmEf', 'eb1hJf', 'nprQif'} and self.error_code in {
+            '401', '403', 'UNAUTHENTICATED', 'PERMISSION_DENIED',
+            'PUBLIC_ERROR_UNUSUAL_ACTIVITY', 'PUBLIC_ERROR_UNUSUAL_ACTIVITY_TOO_MUCH_TRAFFIC',
+        }
 
 
 class FlowFrontendMixin:
@@ -104,24 +126,24 @@ class FlowFrontendMixin:
                         code = item[6]
                     code = code if code is not None else "unknown"
                     if str(code) == "401":
-                        raise RuntimeError(
+                        raise FlowRPCRejected(
                             "Flow 登录认证失败：Google Cookie 已失效、不完整，或来自不同账号 "
-                            f"(rpc={rpc_id}, code=401)"
+                            f"(rpc={rpc_id}, code=401)", rpc_id, code,
                         )
-                    raise RuntimeError(
-                        f"Flow frontend RPC rejected: rpc={rpc_id}, code={code}"
+                    raise FlowRPCRejected(
+                        f"Flow frontend RPC rejected: rpc={rpc_id}, code={code}", rpc_id, code,
                     )
                 if item[0] != "wrb.fr" or item[1] != rpc_id:
                     continue
                 error_detail = item[5] if len(item) > 5 else None
                 error_code = cls._extract_frontend_rpc_error_code(error_detail)
                 if error_code:
-                    raise RuntimeError(
-                        f"Flow frontend RPC rejected: rpc={rpc_id}, error={error_code}"
+                    raise FlowRPCRejected(
+                        f"Flow frontend RPC rejected: rpc={rpc_id}, error={error_code}", rpc_id, error_code,
                     )
                 if item[2] is None and error_detail is not None:
-                    raise RuntimeError(
-                        f"Flow frontend RPC rejected: rpc={rpc_id}, code={error_detail}"
+                    raise FlowRPCRejected(
+                        f"Flow frontend RPC rejected: rpc={rpc_id}, code={error_detail}", rpc_id, error_detail,
                     )
 
     async def _resolve_flow_frontend_cookie_header(
@@ -206,7 +228,6 @@ class FlowFrontendMixin:
             None,
             client_context,
             [[[prompt]]],
-            None,
             None,
             None,
             None,
@@ -581,11 +602,107 @@ class FlowFrontendMixin:
             )
         return {"operations": normalized or operations, "frontendRpc": "jwpduf"}
 
+    @staticmethod
+    def _frontend_bootstrap_cookie_updates(response: Any) -> List[Dict[str, Any]]:
+        """Retain only cookies a successful HTTPS Flow page can set."""
+        origin = urlparse(str(response.url))
+        if origin.scheme != "https" or origin.hostname != "flow.google.com":
+            return []
+        default_path = (origin.path or "/").rsplit("/", 1)[0] or "/"
+        updates: List[Dict[str, Any]] = []
+        for header in response.headers.get_list("set-cookie"):
+            parsed = SimpleCookie()
+            try:
+                parsed.load(header or "")
+            except CookieError:
+                continue
+            for name, morsel in parsed.items():
+                domain = morsel["domain"].lower().lstrip(".")
+                if domain and domain not in {"google.com", "flow.google.com"}:
+                    continue
+                path = morsel["path"] or default_path
+                if not path.startswith("/"):
+                    path = default_path
+                secure = bool(morsel["secure"])
+                if name.startswith("__Secure-") and not secure:
+                    continue
+                if name.startswith("__Host-") and (
+                    not secure or domain or morsel["path"] != "/"
+                ):
+                    continue
+                item: Dict[str, Any] = {
+                    "name": name,
+                    "value": morsel.value,
+                    "domain": domain or "flow.google.com",
+                    "hostOnly": not bool(domain),
+                    "path": path,
+                    "secure": secure,
+                }
+                try:
+                    if morsel["max-age"]:
+                        # Keep deletion records so an old saved cookie is removed.
+                        max_age = int(morsel["max-age"])
+                        item["expires"] = time.time() + max_age if max_age > 0 else 1
+                    elif morsel["expires"]:
+                        expires = parsedate_to_datetime(
+                            morsel["expires"]
+                        ).timestamp()
+                        # The storage adapter reserves 0/-1 for session cookies.
+                        item["expires"] = expires if expires > time.time() else 1
+                except (TypeError, ValueError, OverflowError):
+                    pass
+                updates.append(item)
+        return updates
+
+    @staticmethod
+    def _frontend_cookie_header_with_updates(
+        cookie_storage: Optional[str],
+        cookie_header: str,
+        target_url: str,
+        cookie_updates: List[Dict[str, Any]],
+    ) -> str:
+        """Merge bootstrap cookies locally, preserving stored scope and duplicates."""
+        raw = str(cookie_storage or "").strip() or cookie_header
+        if not cookie_updates:
+            return serialize_cookie_header_for_url(raw, target_url)
+        if urlparse(target_url).hostname != "flow.google.com":
+            return serialize_cookie_header_for_url(raw, target_url)
+        try:
+            base = json.loads(raw)
+        except (TypeError, ValueError):
+            base = parse_browser_cookie_payload(raw)
+        if isinstance(base, dict):
+            if isinstance(base.get("cookies"), list):
+                base = base["cookies"]
+            elif {"name", "value"}.issubset(base):
+                base = [base]
+            else:
+                base = [
+                    {"name": key, "value": value, "url": "https://flow.google.com/"}
+                    for key, value in base.items()
+                ]
+        if not isinstance(base, list):
+            base = []
+
+        def key(item: Dict[str, Any]) -> tuple[str, str, str]:
+            domain = str(item.get("domain") or "").lower().lstrip(".")
+            if not domain:
+                domain = (
+                    urlparse(str(item.get("url") or "")).hostname or "flow.google.com"
+                )
+            return domain, str(item.get("path") or "/"), str(item.get("name") or "")
+
+        merged = {key(item): dict(item) for item in base if isinstance(item, dict)}
+        for item in cookie_updates:
+            merged[key(item)] = dict(item)
+        return serialize_cookie_header_for_url(list(merged.values()), target_url)
+
     async def _load_flow_frontend_bootstrap(
         self,
         page_url: str,
         cookie_header: str,
         timeout: int,
+        cookie_updates: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         proxy_url = None
         if self.proxy_manager:
@@ -622,6 +739,8 @@ class FlowFrontendMixin:
             raise RuntimeError(
                 f"Flow frontend bootstrap failed: HTTP {response.status_code}"
             )
+        if cookie_updates is not None:
+            cookie_updates.extend(self._frontend_bootstrap_cookie_updates(response))
         return response.text
 
     async def _call_flow_frontend_rpc(
@@ -645,10 +764,12 @@ class FlowFrontendMixin:
         )
         if not bootstrap_cookie_header:
             raise RuntimeError("Flow frontend RPC requires Google session cookies")
+        cookie_updates: List[Dict[str, Any]] = []
         bootstrap_text = await self._load_flow_frontend_bootstrap(
             page_url,
             bootstrap_cookie_header,
             timeout,
+            cookie_updates=cookie_updates,
         )
         bootloader_match = re.search(
             r"boq_labs-ai-sandbox-frontend_[A-Za-z0-9_.-]+",
@@ -668,10 +789,8 @@ class FlowFrontendMixin:
             f"&f.sid={frontend_session_id}&hl=en"
             f"&_reqid={request_counter}&rt=c"
         )
-        rpc_cookie_header = (
-            serialize_cookie_header_for_url(cookie_storage, url)
-            if str(cookie_storage or "").strip()
-            else cookie_header
+        rpc_cookie_header = self._frontend_cookie_header_with_updates(
+            cookie_storage, cookie_header, url, cookie_updates
         )
         if not rpc_cookie_header:
             raise RuntimeError("Flow frontend RPC requires Google session cookies")
@@ -692,7 +811,11 @@ class FlowFrontendMixin:
         f_request = self._compact_json_dumps(
             [[[rpc_id, self._compact_json_dumps(argument), None, "generic"]]]
         )
-        request_body = urlencode({"f.req": f_request})
+        request_fields = {"f.req": f_request}
+        at_token = self._extract_stream_chat_at_token(bootstrap_text)
+        if at_token:
+            request_fields["at"] = at_token
+        request_body = urlencode(request_fields)
         response_text = await self._make_text_request(
             method="POST",
             url=url,
@@ -705,11 +828,12 @@ class FlowFrontendMixin:
         )
         xsrf_match = re.search(r'\["xsrf","([^"]+)"', response_text)
         if xsrf_match:
+            request_fields["at"] = xsrf_match.group(1)
             response_text = await self._make_text_request(
                 method="POST",
                 url=url,
                 headers=headers,
-                raw_body=request_body + "&at=" + quote(xsrf_match.group(1), safe=""),
+                raw_body=urlencode(request_fields),
                 timeout=timeout,
                 apply_default_client_headers=False,
                 return_error_response=True,
@@ -821,10 +945,12 @@ class FlowFrontendMixin:
         )
         if not bootstrap_cookie_header:
             raise RuntimeError("Flow StreamChat requires Google session cookies")
+        cookie_updates: List[Dict[str, Any]] = []
         bootstrap_text = await self._load_flow_frontend_bootstrap(
             page_url,
             bootstrap_cookie_header,
             timeout,
+            cookie_updates=cookie_updates,
         )
         bootloader_match = re.search(
             r"boq_labs-ai-sandbox-frontend_[A-Za-z0-9_.-]+",
@@ -843,10 +969,8 @@ class FlowFrontendMixin:
             f"&f.sid={session_match.group(1)}&hl=en"
             f"&_reqid={random.randint(100000, 999999)}&rt=c"
         )
-        rpc_cookie_header = (
-            serialize_cookie_header_for_url(cookie_storage, url)
-            if str(cookie_storage or "").strip()
-            else cookie_header
+        rpc_cookie_header = self._frontend_cookie_header_with_updates(
+            cookie_storage, cookie_header, url, cookie_updates
         )
         if not rpc_cookie_header:
             raise RuntimeError("Flow StreamChat requires Google session cookies")

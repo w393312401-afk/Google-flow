@@ -49,6 +49,7 @@ proxy_manager: ProxyManager = None
 db: Database = None
 concurrency_manager: Optional[ConcurrencyManager] = None
 captcha_runtime_prepare_tasks: Dict[str, asyncio.Task] = {}
+refresh_all_running = False
 
 # Store active admin session tokens (in production, use Redis or database)
 active_admin_tokens = set()
@@ -678,6 +679,8 @@ class AddTokenRequest(BaseModel):
     proxy_url: Optional[str] = None
     auto_refresh_enabled: bool = True
     refresh_interval_minutes: int = 120
+    is_active: bool = True
+    adspower_serial: Optional[int] = Field(default=None, ge=0, le=1000000)
 
     @field_validator("login_account")
     @classmethod
@@ -706,6 +709,8 @@ class UpdateTokenRequest(BaseModel):
     proxy_url: Optional[str] = None
     auto_refresh_enabled: Optional[bool] = None
     refresh_interval_minutes: Optional[int] = None
+    auto_enable_on_update: bool = True
+    adspower_serial: Optional[int] = Field(default=None, ge=0, le=1000000)
 
     @field_validator("login_account")
     @classmethod
@@ -945,6 +950,15 @@ async def change_password(
 # ========== Token Management ==========
 
 
+@router.get("/api/exit-ip-rotation/status")
+async def get_exit_ip_rotation_status(token: str = Depends(verify_admin_token)):
+    """Safe account counters and exit metadata; never proxy credentials."""
+    manager = getattr(token_manager, "exit_rotation", None)
+    if manager is None:
+        return {"enabled": False, "threshold": 5, "token_ids": [], "accounts": {}}
+    return await manager.snapshot()
+
+
 @router.get("/api/tokens")
 async def get_tokens(token: str = Depends(verify_admin_token)):
     """Get all tokens with statistics"""
@@ -985,6 +999,7 @@ async def get_tokens(token: str = Depends(verify_admin_token)):
         "email": row.get("email"),
         "name": row.get("name"),
         "remark": row.get("remark"),
+        "adspower_serial": row.get("adspower_serial"),
         "is_active": bool(row.get("is_active")),
             "created_at": to_iso(row.get("created_at"))
             if row.get("created_at")
@@ -1055,6 +1070,8 @@ async def add_token(request: AddTokenRequest, token: str = Depends(verify_admin_
             proxy_url=request.proxy_url,
             auto_refresh_enabled=request.auto_refresh_enabled,
             refresh_interval_minutes=request.refresh_interval_minutes,
+            is_active=request.is_active,
+            adspower_serial=request.adspower_serial,
         )
 
         # 热更新并发限制，避免必须重启服务
@@ -1089,14 +1106,18 @@ async def update_token(
     """Validate current Flow cookies and update an account."""
     try:
         existing = await token_manager.get_token(token_id)
+        if existing is None:
+            raise ValueError("Token not found")
         session_value = request.st or (existing.st if existing else "")
         google_cookies = request.google_cookies or (
             existing.google_cookies if existing else ""
         )
-        result = await token_manager.flow_client.st_to_at(
-            session_value,
-            google_cookies=google_cookies,
-            token_id=token_id,
+        validation_proxy = (existing.proxy_url if request.proxy_url is None else
+                            token_manager._normalize_token_proxy_url(request.proxy_url))
+        result = await token_manager._flow_call_with_proxy(
+            validation_proxy, lambda: token_manager.flow_client.st_to_at(
+                session_value, google_cookies=google_cookies, token_id=token_id,
+            ),
         )
         at = result["access_token"]
         expires = result.get("expires")
@@ -1138,10 +1159,15 @@ async def update_token(
             proxy_url=request.proxy_url,
             auto_refresh_enabled=request.auto_refresh_enabled,
             refresh_interval_minutes=request.refresh_interval_minutes,
+            auto_enable_on_update=request.auto_enable_on_update,
+            adspower_serial=request.adspower_serial,
         )
 
-        # 热更新并发限制，确保管理台修改立即生效
-        if concurrency_manager:
+        # Cookie-only sync does not change concurrency settings.
+        # Enable flags are read from the token by the load balancer separately.
+        if concurrency_manager and (
+            request.image_concurrency is not None or request.video_concurrency is not None
+        ):
             updated_token = await token_manager.get_token(token_id)
             if updated_token:
                 await concurrency_manager.reset_token(
@@ -1196,54 +1222,124 @@ async def refresh_credits(token_id: int, token: str = Depends(verify_admin_token
 @router.post("/api/tokens/{token_id}/refresh-at")
 async def refresh_at(token_id: int, token: str = Depends(verify_admin_token)):
     """手动刷新Token的AT (使用ST转换) 🆕
-    
-    如果 AT 刷新失败且处于 personal 模式，会自动尝试通过浏览器刷新 ST
+
+    失败时返回真实原因；代理/网络类瞬时失败会自动重试。
     """
     from ..core.logger import debug_logger
-    from ..core.config import config
-    
-    debug_logger.log_info(
-        f"[API] 手动刷新 AT 请求: token_id={token_id}, captcha_method={config.captcha_method}"
-    )
-    
-    try:
-        # 调用token_manager的内部刷新方法（包含 ST 自动刷新逻辑）
-        success = await token_manager._refresh_at(token_id)
 
-        if success:
-            # 获取更新后的token信息
-            updated_token = await token_manager.get_token(token_id)
-            
-            message = "AT刷新成功"
-            if config.captcha_method == "personal":
-                message += "（支持ST自动刷新）"
-            
-            debug_logger.log_info(f"[API] AT 刷新成功: token_id={token_id}")
-            
-            return {
-                "success": True,
-                "message": message,
-                "token": {
-                    "id": updated_token.id,
-                    "email": updated_token.email,
-                    "at_expires": updated_token.at_expires.isoformat()
-                    if updated_token.at_expires
-                    else None,
-                },
-            }
-        else:
-            debug_logger.log_error(f"[API] AT 刷新失败: token_id={token_id}")
-            
-            error_detail = "AT刷新失败"
-            if config.captcha_method != "personal":
-                error_detail += f"（当前打码模式: {config.captcha_method}，ST自动刷新仅在 personal 模式下可用）"
-            
-            raise HTTPException(status_code=500, detail=error_detail)
-    except HTTPException:
-        raise
-    except Exception as e:
-        debug_logger.log_error(f"[API] 刷新AT异常: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"刷新AT失败: {str(e)}")
+    debug_logger.log_info(f"[API] 手动刷新 AT 请求: token_id={token_id}")
+
+    target = await token_manager.get_token(token_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Token不存在")
+
+    result = await _refresh_token_for_batch(target)
+    if result["success"]:
+        debug_logger.log_info(f"[API] AT 刷新成功: token_id={token_id}")
+        return {
+            "success": True,
+            "message": "AT刷新成功",
+            "token": {
+                "id": target.id,
+                "email": target.email,
+                "at_expires": result.get("at_expires"),
+            },
+        }
+
+    debug_logger.log_error(
+        f"[API] AT 刷新失败: token_id={token_id}, {result.get('error')}"
+    )
+    raise HTTPException(
+        status_code=500,
+        detail=_describe_refresh_failure(result.get("error", ""), bool(result.get("disabled"))),
+    )
+
+
+def _describe_refresh_failure(reason: str, disabled: bool) -> str:
+    """把刷新失败的原因类别翻译成可操作的提示，不暴露响应体或 Cookie。"""
+    if "credentials rejected" in reason:
+        message = "Google 登录态已失效（Cookie 被拒绝），请在对应 AdsPower 环境重新登录 Google 后同步 Cookie"
+        if disabled:
+            message += "；该账号已被自动禁用"
+    elif REFRESH_ALL_TRANSIENT_REASON in reason:
+        message = "网络或代理暂时不可用（已自动重试），请稍后再试或检查该账号的代理"
+    elif "traffic restriction" in reason:
+        message = "上游流量限制，请稍后再试"
+    else:
+        message = reason or "未知错误"
+    return f"AT刷新失败: {message}"
+
+
+# 代理/网络抖动属于瞬时失败，值得重试；认证失败、上游流量限制等不重试
+REFRESH_ALL_TRANSIENT_REASON = "network or proxy unavailable"
+refresh_all_retry_delays = (2.0, 5.0)
+
+
+async def _refresh_token_for_batch(item) -> Dict[str, Any]:
+    """刷新单个账号的 AT，瞬时网络失败时按 refresh_all_retry_delays 重试。"""
+    from ..core.logger import debug_logger
+
+    entry: Dict[str, Any] = {"id": item.id, "email": item.email, "success": False}
+    for attempt in range(len(refresh_all_retry_delays) + 1):
+        entry["attempts"] = attempt + 1
+        try:
+            if await token_manager._refresh_at(item.id):
+                updated = await token_manager.get_token(item.id)
+                entry["success"] = True
+                entry.pop("error", None)
+                entry.pop("disabled", None)
+                if updated and updated.at_expires:
+                    entry["at_expires"] = updated.at_expires.isoformat()
+                return entry
+            reason = token_manager._last_at_refresh_error.get(item.id) or "AT刷新失败"
+            current = await token_manager.get_token(item.id)
+            entry["error"] = _truncate_text(reason)
+            entry["disabled"] = bool(current and not current.is_active)
+        except Exception as e:
+            debug_logger.log_error(f"[API] 全部刷新 AT 异常: token_id={item.id}, {e}")
+            entry["error"] = _truncate_text(e)
+            return entry
+        if (
+            entry["disabled"]
+            or REFRESH_ALL_TRANSIENT_REASON not in reason
+            or attempt >= len(refresh_all_retry_delays)
+        ):
+            return entry
+        await asyncio.sleep(refresh_all_retry_delays[attempt])
+    return entry
+
+
+@router.post("/api/tokens/refresh-all")
+async def refresh_all_tokens(token: str = Depends(verify_admin_token)):
+    """一键刷新所有已启用账号的 AT
+
+    顺序执行，单个账号失败不影响其余账号；手动禁用的账号不会被触碰。
+    代理/网络类瞬时失败会自动重试，认证失败不重试。
+    """
+    from ..core.logger import debug_logger
+
+    global refresh_all_running
+    if refresh_all_running:
+        raise HTTPException(status_code=409, detail="全部刷新正在进行中，请稍后再试")
+    refresh_all_running = True
+    try:
+        tokens = [t for t in await token_manager.get_all_tokens() if t.is_active]
+        debug_logger.log_info(f"[API] 全部刷新 AT 请求: 共 {len(tokens)} 个已启用账号")
+        results = [await _refresh_token_for_batch(item) for item in tokens]
+
+        succeeded = sum(1 for r in results if r["success"])
+        debug_logger.log_info(
+            f"[API] 全部刷新 AT 完成: 成功 {succeeded}/{len(results)}"
+        )
+        return {
+            "success": True,
+            "total": len(results),
+            "succeeded": succeeded,
+            "failed": len(results) - succeeded,
+            "results": results,
+        }
+    finally:
+        refresh_all_running = False
 
 
 @router.post("/api/tokens/st2at")

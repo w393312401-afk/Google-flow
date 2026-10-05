@@ -18,6 +18,7 @@ import random
 import uuid
 import hashlib
 import json
+import tempfile
 from copy import deepcopy
 from typing import Optional, Dict, Any, List, Union
 from datetime import datetime
@@ -31,6 +32,7 @@ from ..core.browser_runtime_status import (
 )
 from ..core.config import config
 from .browser_cookie_utils import build_browser_cookie_targets, build_cookie_signature
+from .captcha_errors import BrowserCaptchaError
 
 
 # ==================== Docker 环境检测 ====================
@@ -514,8 +516,247 @@ class TokenBrowser:
         self._last_idle_since = time.monotonic()
         # harvest 模式状态：页面原生 StreamChat 请求体与会话 id
         self._harvest_streamchat_post: Optional[str] = None
+        self._harvest_rpc: Optional[str] = None
         self._last_harvest_session_id: Optional[str] = None
+        self._captcha_stage = "idle"
+        self._captcha_started_at = time.monotonic()
+        self._captcha_diagnostics: List[Dict[str, Any]] = []
+        self._harvest_route_error: Optional[str] = None
         self._refresh_browser_profile()
+
+    # Leave a small allowance for closing the temporary page after cancellation.
+    CAPTCHA_SOLVE_TIMEOUT_SECONDS = 85.0
+    CAPTCHA_REQUEST_TIMEOUT_SECONDS = 175.0
+    # Private screenshots of a page that never showed the editor. None means the
+    # project's local directory, beside the other failure captures; the count is bounded.
+    EDITOR_EVIDENCE_DIR = None
+    EDITOR_EVIDENCE_KEEP = 20
+
+    @staticmethod
+    def _classify_captcha_error(error: Exception) -> str:
+        # Inspect messages only to select a fixed category. Never persist the raw
+        # exception: Playwright errors can contain URLs, DOM text and credentials.
+        message = str(error).lower()
+        for needle, reason in (
+            ("cookie should have either", "cookie_scope_invalid"),
+            ("trusted", "trusted_types"),
+            ("content security policy", "content_security_policy"),
+            ("err_proxy", "proxy_connection_failed"),
+            ("err_tunnel", "proxy_connection_failed"),
+            ("err_name_not_resolved", "dns_failed"),
+            ("err_cert", "certificate_failed"),
+            ("err_connection", "network_connection_failed"),
+            ("err_empty_response", "network_empty_response"),
+            ("err_aborted", "navigation_interrupted"),
+            ("interrupted by another navigation", "navigation_interrupted"),
+            ("executable doesn't exist", "browser_executable_missing"),
+            ("closed", "browser_closed"),
+        ):
+            if needle in message:
+                return reason
+        if isinstance(error, (asyncio.TimeoutError, TimeoutError)) or "timeout" in message:
+            return "timeout"
+        return "browser_operation_failed"
+
+    def _record_captcha_stage(self, stage: str, reason: Optional[str] = None, **fields):
+        """Keep a bounded, private diagnostic containing only allowlisted fields."""
+        self._captcha_stage = stage
+        entry = {
+            "stage": stage,
+            "elapsed_ms": round((time.monotonic() - self._captcha_started_at) * 1000),
+        }
+        if reason:
+            entry["reason"] = reason
+        for key in (
+            "editor_present", "editor_visible", "submit_present", "submit_disabled",
+            "captcha_ready", "overlay_count", "login_link", "cookie_count",
+            "has_flow_session", "has_google_account", "proxy_active", "custom_executable",
+            "bootstrap_attempts",
+        ):
+            if isinstance(fields.get(key), (bool, int)):
+                entry[key] = fields[key]
+        for key, allowed in {
+            "location": {"flow_project", "flow_home", "flow_landing", "google_signin", "other"},
+            "ready_state": {"loading", "interactive", "complete"},
+            "platform": {"darwin", "win32", "linux"},
+            "bootstrap_state": {"idle", "loading", "loaded", "error", "absent"},
+            "harvest_transport": {"streamchat", "batchexecute"},
+            "harvest_rpc": {"StreamChat", "ogiZ0b", "YhhmEf", "nprQif", "eb1hJf", "MZZa6b"},
+        }.items():
+            if fields.get(key) in allowed:
+                entry[key] = fields[key]
+        shape = fields.get("payload_shape")
+        if isinstance(shape, str) and re.fullmatch(r"[abnosz?:0-9,\[\].]{1,600}", shape):
+            entry["payload_shape"] = shape
+        self._captcha_diagnostics.append(entry)
+        self._captcha_diagnostics = self._captcha_diagnostics[-48:]
+        # Separate from debug_logger: enabling full request logging exposes Google
+        # cookies and captcha payloads. One file per slot bounds disk usage too.
+        diagnostic_dir = os.path.join(self._pid_dir, "diagnostics")
+        temporary_path = None
+        try:
+            os.makedirs(diagnostic_dir, mode=0o700, exist_ok=True)
+            os.chmod(diagnostic_dir, 0o700)
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=diagnostic_dir, delete=False
+            ) as diagnostic_file:
+                temporary_path = diagnostic_file.name
+                os.chmod(temporary_path, 0o600)
+                json.dump(self._captcha_diagnostics, diagnostic_file, ensure_ascii=True)
+            os.replace(temporary_path, os.path.join(diagnostic_dir, f"slot_{self.token_id}.json"))
+        except OSError:
+            if temporary_path:
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    pass
+
+    async def _capture_captcha_page_state(self, page) -> Dict[str, Any]:
+        try:
+            state = await asyncio.wait_for(page.evaluate("""() => {
+                const editor = document.querySelector('.ProseMirror');
+                const submit = document.querySelector(
+                    "button[aria-label='Start generation'], button[aria-label='开始生成'], button[aria-label='開始生成']"
+                );
+                const host = location.hostname;
+                const path = location.pathname;
+                const bootstrap = window.__flow2apiRecaptchaBootstrapState;
+                return {
+                    location: host === 'accounts.google.com' ? 'google_signin' :
+                        host === 'flow.google.com' ? (path.startsWith('/project/') ? 'flow_project' :
+                        path.startsWith('/about') ? 'flow_landing' : 'flow_home') : 'other',
+                    ready_state: document.readyState,
+                    editor_present: !!editor,
+                    editor_visible: !!editor && !!(editor.offsetWidth || editor.offsetHeight || editor.getClientRects().length),
+                    submit_present: !!submit,
+                    submit_disabled: !!submit && !!submit.disabled,
+                    captcha_ready: !!window.grecaptcha?.enterprise,
+                    bootstrap_state: bootstrap?.status || 'absent',
+                    bootstrap_attempts: Math.min(99, Number(bootstrap?.attempts || 0)),
+                    overlay_count: Math.min(99, document.querySelectorAll('.cdk-overlay-backdrop').length),
+                    login_link: !!document.querySelector('a[href*="accounts.google.com/ServiceLogin"], a[href*="accounts.google.com/signin"]'),
+                };
+            }"""), timeout=2)
+            return state if isinstance(state, dict) else {}
+        except Exception:
+            return {}
+
+    async def _wait_for_flow_editor(self, page) -> None:
+        """Bound SPA readiness to the visible input that native submit uses."""
+        self._record_captcha_stage("editor_readiness")
+        wait_error = None
+        try:
+            await page.locator(".ProseMirror:visible").first.wait_for(timeout=15000)
+        except Exception as error:
+            wait_error = error
+        state = await self._capture_captcha_page_state(page)
+        self._record_captcha_stage("editor_readiness", **state)
+        if state.get("location") == "google_signin" or state.get("login_link"):
+            raise self._captcha_failure("login_required") from None
+        if state.get("location") == "flow_landing":
+            raise self._captcha_failure("flow_editor_unavailable") from None
+        if wait_error is not None:
+            reason = self._classify_captcha_error(wait_error)
+            raise self._captcha_failure("editor_missing" if reason == "timeout" else reason) from None
+
+    async def _ensure_flow_editor(self, page) -> None:
+        """Wait for the editor and keep what the page showed if it never appears."""
+        try:
+            await self._wait_for_flow_editor(page)
+        except BrowserCaptchaError as error:
+            await self._save_editor_failure_evidence(page, error.reason)
+            raise
+
+    async def _save_editor_failure_evidence(self, page, reason: str) -> None:
+        """Keep the failed page as a private screenshot with its allowlisted diagnostics.
+
+        A screenshot can show account UI, so it stays owner-only in the local
+        directory. Evidence must never replace or delay the original failure.
+        """
+        try:
+            screenshot = await asyncio.wait_for(page.screenshot(timeout=1500), timeout=3)
+            if not isinstance(screenshot, bytes):
+                return
+            directory = self.EDITOR_EVIDENCE_DIR or os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "..", "local")
+            )
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            name = f"editor-readiness-{time.time_ns()}.png"
+            descriptor = os.open(
+                os.path.join(directory, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            )
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(screenshot)
+            kept = sorted(
+                item for item in os.listdir(directory)
+                if item.startswith("editor-readiness-") and item.endswith(".png")
+            )
+            for stale in kept[:-self.EDITOR_EVIDENCE_KEEP]:
+                try:
+                    os.unlink(os.path.join(directory, stale))
+                except OSError:
+                    pass
+            entry = {
+                "time": time.time(), "reason": reason, "screenshot": name,
+                "account_id": self._shared_bound_token_id,
+                "diagnostics": self._captcha_diagnostics[-3:],
+            }
+            descriptor = os.open(
+                os.path.join(directory, "editor-readiness-diagnostics.jsonl"),
+                os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600,
+            )
+            with os.fdopen(descriptor, "a", encoding="utf-8") as output:
+                output.write(json.dumps(entry, ensure_ascii=True) + "\n")
+        except Exception:
+            pass
+
+    def _captcha_failure(self, reason: str) -> BrowserCaptchaError:
+        self._record_captcha_stage(self._captcha_stage, reason)
+        return BrowserCaptchaError(self._captcha_stage, reason)
+
+    @staticmethod
+    def _harvest_payload_shape(value, depth: int = 4) -> str:
+        """Describe only container lengths and scalar types, never their values."""
+        if isinstance(value, list):
+            if depth <= 0:
+                return f"a{len(value)}"
+            children = ",".join(TokenBrowser._harvest_payload_shape(item, depth - 1) for item in value[:16])
+            return f"a{len(value)}[{children}]"[:600]
+        if value is None:
+            return "z"
+        if isinstance(value, bool):
+            return "b"
+        if isinstance(value, str):
+            return "s"
+        if isinstance(value, (int, float)):
+            return "n"
+        return "o" if isinstance(value, dict) else "?"
+
+    @staticmethod
+    def _harvest_batch_rows(post_data: str) -> List[Any]:
+        payload = json.loads(parse_qs(post_data, keep_blank_values=True)["f.req"][0])
+        if not isinstance(payload, list):
+            return []
+        return [row for batch in payload if isinstance(batch, list)
+                for row in batch if isinstance(row, list) and row and isinstance(row[0], str)]
+
+    @classmethod
+    def _harvest_generation_rpc(cls, url: str, post_data: str) -> Optional[str]:
+        parsed = urlparse(url)
+        if "StreamChat" in parsed.path:
+            return "StreamChat"
+        if not parsed.path.endswith("/batchexecute"):
+            return None
+        # Check both the URL and body. A malformed body must still be aborted if
+        # the URL identifies a generation RPC; the query may also batch RPC IDs.
+        candidates = []
+        for group in parse_qs(parsed.query).get("rpcids", []):
+            candidates.extend(group.split(","))
+        try:
+            candidates = [row[0] for row in cls._harvest_batch_rows(post_data)] + candidates
+        except Exception:
+            pass
+        return next((rpc for rpc in candidates if rpc in {"ogiZ0b", "YhhmEf"}), None)
 
     def _refresh_browser_profile(self):
         """Refresh the in-memory browser fingerprint profile."""
@@ -553,6 +794,104 @@ class TokenBrowser:
             ]
         )
 
+    @staticmethod
+    def _should_activate_browser_window() -> bool:
+        return not bool(getattr(config, "browser_launch_background", True))
+
+    async def _new_page(self, context):
+        """Create headed Chromium pages without activating the user's desktop.
+
+        Playwright's new_page uses Target.createTarget without background=True.
+        The keepalive page supplies the exact context ID; a fresh slot owns only
+        one browser context, so its first page can also be created in background.
+        """
+        if self._should_activate_browser_window():
+            return await context.new_page()
+
+        pages = list(context.pages)
+        if pages:
+            session = await context.new_cdp_session(pages[0])
+        else:
+            session = await context.browser.new_browser_cdp_session()
+        target_id = None
+        create_task = None
+
+        async def close_created_pages():
+            nonlocal target_id
+            # Chromium may create the target before its CDP response reaches us.
+            # Recover that response on cancellation instead of abandoning a tab.
+            if create_task is not None and target_id is None:
+                try:
+                    result = await asyncio.wait_for(asyncio.shield(create_task), timeout=3)
+                    target_id = result.get("targetId")
+                except (Exception, asyncio.CancelledError):
+                    create_task.cancel()
+                    await asyncio.gather(create_task, return_exceptions=True)
+            if target_id:
+                try:
+                    await asyncio.wait_for(session.send("Target.closeTarget", {
+                        "targetId": target_id,
+                    }), timeout=3)
+                except Exception:
+                    pass
+            for created_page in list(context.pages):
+                if created_page not in pages:
+                    try:
+                        await asyncio.wait_for(created_page.close(), timeout=3)
+                    except Exception:
+                        pass
+
+        try:
+            if pages:
+                info = await session.send("Target.getTargetInfo")
+                context_id = info.get("targetInfo", {}).get("browserContextId")
+            else:
+                info = await session.send("Target.getBrowserContexts")
+                context_ids = info.get("browserContextIds", [])
+                context_id = context_ids[0] if len(context_ids) == 1 else None
+            if not context_id:
+                raise RuntimeError("background page browser context unavailable")
+
+            async with context.expect_page(timeout=10000) as pending_page:
+                create_task = asyncio.create_task(session.send("Target.createTarget", {
+                    "url": "about:blank",
+                    "browserContextId": context_id,
+                    "background": True,
+                }))
+                result = await asyncio.wait_for(asyncio.shield(create_task), timeout=10)
+                target_id = result["targetId"]
+            page = await pending_page.value
+            # Chromium can restore an existing minimized window when adding a
+            # background tab. Keep our own window minimized after every creation.
+            try:
+                # The target event can precede the native window's ShowInactive
+                # update. Let that update settle before reading its window state.
+                await asyncio.sleep(0.1)
+                window = await session.send("Browser.getWindowForTarget", {
+                    "targetId": target_id,
+                })
+                if window.get("bounds", {}).get("windowState") != "minimized":
+                    await session.send("Browser.setWindowBounds", {
+                        "windowId": window["windowId"],
+                        "bounds": {"windowState": "minimized"},
+                    })
+            except Exception as error:
+                debug_logger.log_warning(
+                    f"[BrowserCaptcha] Token-{self.token_id} background window minimize failed: {type(error).__name__}"
+                )
+            return page
+        except BaseException:
+            await close_created_pages()
+            raise
+        finally:
+            try:
+                await asyncio.wait_for(session.detach(), timeout=3)
+            except asyncio.CancelledError:
+                await close_created_pages()
+                raise
+            except Exception:
+                pass
+
     def _build_browser_environment_patch_config(self) -> Dict[str, Any]:
         viewport = dict(self._profile_viewport or {})
         width = int(viewport.get("width") or 1366)
@@ -566,6 +905,7 @@ class TokenBrowser:
 
         return {
             "seed": seed[:16],
+            "allowWindowFocus": self._should_activate_browser_window(),
             "navigator": {
                 "language": "en-US",
                 "languages": ["en-US", "en"],
@@ -770,7 +1110,7 @@ class TokenBrowser:
     defineGetter(Document.prototype, "webkitHidden", () => false);
     defineGetter(document, "webkitHidden", () => false);
     try { document.hasFocus = makeNative(() => true, "hasFocus"); } catch (e) {}
-    try { if (typeof window.focus === "function") window.focus(); } catch (e) {}
+    try { if (config.allowWindowFocus && typeof window.focus === "function") window.focus(); } catch (e) {}
 
     const makeArrayLike = (items, namedKey) => {
         const arr = [];
@@ -1159,7 +1499,7 @@ class TokenBrowser:
         if not self._shared_context:
             return None
 
-        keepalive_page = await self._shared_context.new_page()
+        keepalive_page = await self._new_page(self._shared_context)
         await self._apply_browser_environment_patch(keepalive_page, label="keepalive")
         try:
             await keepalive_page.goto("about:blank", wait_until="load", timeout=5000)
@@ -1188,7 +1528,7 @@ class TokenBrowser:
     @classmethod
     def _build_google_cookie_targets(cls, cookie_storage: str) -> List[Dict[str, Any]]:
         """按浏览器 Cookie 作用域展开登录态，兼容 JSON 与 Header 格式。"""
-        return build_browser_cookie_targets(
+        cookies = build_browser_cookie_targets(
             cookie_storage,
             default_url="https://flow.google.com/",
             fallback_urls=[
@@ -1196,6 +1536,17 @@ class TokenBrowser:
                 "https://www.google.com/",
             ],
         )
+        for cookie in cookies:
+            if cookie.get("url") and "path" in cookie:
+                # Playwright rejects url+path, including Header cookies expanded
+                # by the shared parser. Preserve explicit domain/path cookies.
+                parsed = urlparse(cookie["url"])
+                if cookie["path"] == "/" and parsed.path in {"", "/"}:
+                    cookie.pop("path")
+                else:
+                    cookie["domain"] = parsed.hostname or ""
+                    cookie.pop("url")
+        return cookies
 
     @classmethod
     def _build_token_session_cookie_targets(
@@ -1257,6 +1608,7 @@ class TokenBrowser:
     async def _ensure_shared_token_binding(
         self, context, token_id: Optional[int]
     ) -> bool:
+        self._record_captcha_stage("cookie_binding")
         (
             token_key,
             session_token,
@@ -1273,7 +1625,7 @@ class TokenBrowser:
             debug_logger.log_warning(
                 f"[BrowserCaptcha] Token-{self.token_id} 缺少可用的登录态凭据，无法绑定账号态 (token_id={token_key})"
             )
-            return False
+            raise self._captcha_failure("login_credentials_missing")
 
         if (
             self._shared_bound_token_id == token_key
@@ -1289,7 +1641,14 @@ class TokenBrowser:
             debug_logger.log_warning(
                 f"[BrowserCaptcha] Token-{self.token_id} 构造登录态 cookies 失败 (token_id={token_key})"
             )
-            return False
+            raise self._captcha_failure("cookie_payload_invalid")
+
+        names = {cookie.get("name") for cookie in browser_cookies}
+        self._record_captcha_stage(
+            "cookie_binding", cookie_count=len(browser_cookies),
+            has_flow_session=bool(names & {"OSID", "__Secure-OSID"}),
+            has_google_account=bool(names & {"SID", "__Secure-1PSID", "__Secure-3PSID"}),
+        )
 
         try:
             await context.clear_cookies()
@@ -1306,7 +1665,7 @@ class TokenBrowser:
                 f"[BrowserCaptcha] Token-{self.token_id} 绑定业务 token 登录态失败 "
                 f"(token_id={token_key}): {type(e).__name__}: {str(e)[:200]}"
             )
-            return False
+            raise self._captcha_failure(self._classify_captcha_error(e)) from None
 
     async def _prepare_flow_runtime_page(
         self,
@@ -1319,7 +1678,7 @@ class TokenBrowser:
     ) -> bool:
         """打开真实 Flow 页面并完成页面预热。
 
-        页面级注册 route：捕获页面自身发出的 StreamChat 请求（harvest
+        页面级注册 route：捕获页面自身发出的生成 RPC 请求（harvest
         打码数据源，见 _execute_captcha），其余请求一律直通，不干预页面
         原生加载行为。route 挂在 page 上，页面关闭后自动清理，不影响
         共享 context。
@@ -1336,19 +1695,33 @@ class TokenBrowser:
         )
 
         async def _harvest_stream_route(route):
-            try:
-                request = route.request
-                if (
-                    self._harvest_streamchat_post is None
-                    and request.method == "POST"
-                    and "StreamChat" in request.url
-                ):
-                    self._harvest_streamchat_post = request.post_data or ""
+            request = route.request
+            post_data = (request.post_data or "") if request.method == "POST" else ""
+            rpc = self._harvest_generation_rpc(request.url, post_data) if request.method == "POST" else None
+            if rpc:
+                # Abort every matching request, including duplicate submits. Never
+                # continue a failed abort: the placeholder must not reach Google.
+                try:
                     await route.abort()
-                    return
+                    if self._harvest_streamchat_post is None:
+                        self._harvest_streamchat_post = post_data
+                        self._harvest_rpc = rpc
+                        self._record_captcha_stage(
+                            "request_interception", harvest_rpc=rpc,
+                            harvest_transport="streamchat" if rpc == "StreamChat" else "batchexecute",
+                        )
+                except Exception:
+                    self._harvest_route_error = "request_interception_failed"
+                    self._record_captcha_stage("request_interception", self._harvest_route_error)
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                return
+            try:
                 await route.continue_()
             except Exception:
-                await route.continue_()
+                pass
 
         try:
             await page.route(
@@ -1362,56 +1735,60 @@ class TokenBrowser:
                 f"[BrowserCaptcha] Token-{self.token_id} harvest route 注册失败: "
                 f"{type(route_error).__name__}: {str(route_error)[:150]}"
             )
+            raise self._captcha_failure("route_registration_failed") from None
 
-        page_urls = [
-            self._build_flow_project_url(project_id),
-            "https://flow.google.com/about",
-        ]
+        target_url = self._build_flow_project_url(project_id)
         label = f"{context_label} " if context_label else ""
 
-        loaded = False
-        last_error: Optional[str] = None
-        for index, target_url in enumerate(page_urls):
-            try:
-                debug_logger.log_info(
-                    f"[BrowserCaptcha] Token-{self.token_id} {label}打开真实 Flow 页面: {target_url} (action={action})"
-                )
-                await page.goto(
-                    target_url, wait_until="domcontentloaded", timeout=45000
-                )
-                loaded = True
-                break
-            except Exception as e:
-                last_error = f"{type(e).__name__}: {str(e)[:200]}"
-                debug_logger.log_warning(
-                    f"[BrowserCaptcha] Token-{self.token_id} {label}Flow 页面打开失败[{index + 1}/{len(page_urls)}]: {last_error}"
-                )
-
-        if not loaded:
-            debug_logger.log_warning(
-                f"[BrowserCaptcha] Token-{self.token_id} {label}无法打开真实 Flow 页面: {last_error or 'unknown'}"
+        try:
+            self._record_captcha_stage("navigation")
+            debug_logger.log_info(
+                f"[BrowserCaptcha] Token-{self.token_id} {label}打开真实 Flow 页面: {target_url} (action={action})"
             )
-            return False
-
-        page_loaded = False
-        for _ in range(20):
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
+        except Exception as error:
+            reason = self._classify_captcha_error(error)
+            state = await self._capture_captcha_page_state(page)
+            self._record_captcha_stage("navigation", reason, **state)
+            if state.get("location") == "google_signin":
+                raise self._captcha_failure("login_required") from None
+            # A SPA redirect can interrupt goto after its project document has
+            # committed. Continue only on that exact destination; a stale page
+            # or a network error cannot establish successful navigation.
             try:
-                ready_state = await page.evaluate("document.readyState")
-                if ready_state == "complete":
-                    page_loaded = True
-                    break
+                actual = urlparse(page.url)
+                expected = urlparse(target_url)
+                committed = (
+                    actual.scheme == expected.scheme
+                    and actual.netloc == expected.netloc
+                    and actual.path.rstrip("/") == expected.path.rstrip("/")
+                    and state.get("location") in {"flow_project", "flow_home"}
+                    and state.get("ready_state") in {"interactive", "complete"}
+                )
+            except Exception:
+                committed = False
+            if reason not in {"timeout", "navigation_interrupted"} or not committed:
+                # The /about landing page has no editor. Navigating there as a
+                # fallback only replaces the useful navigation failure.
+                raise self._captcha_failure(reason) from None
+
+        state = await self._capture_captcha_page_state(page)
+        self._record_captcha_stage("page_loaded", **state)
+        if state.get("location") == "google_signin":
+            raise self._captcha_failure("login_required")
+        if state.get("location") == "flow_landing":
+            raise self._captcha_failure("flow_editor_unavailable")
+
+        # DOMContentLoaded and readyState=complete do not prove that the Flow
+        # application has rendered. Wait for the actual input used by submit,
+        # independent of third-party requests delaying the load event.
+        await self._ensure_flow_editor(page)
+
+        if self._should_activate_browser_window():
+            try:
+                await page.bring_to_front()
             except Exception:
                 pass
-            await asyncio.sleep(0.5)
-        if not page_loaded:
-            debug_logger.log_warning(
-                f"[BrowserCaptcha] Token-{self.token_id} {label}Flow 页面 readyState 未达到 complete，继续尝试预热"
-            )
-
-        try:
-            await page.bring_to_front()
-        except Exception:
-            pass
 
         try:
             await page.mouse.move(320, 220)
@@ -1419,9 +1796,9 @@ class TokenBrowser:
             await page.mouse.wheel(0, 260)
             await page.evaluate(
                 """
-                (() => {
+                (allowWindowFocus) => {
                     try {
-                        window.focus();
+                        if (allowWindowFocus) window.focus();
                         window.dispatchEvent(new Event('focus'));
                         document.dispatchEvent(new MouseEvent('mousemove', {
                             bubbles: true,
@@ -1430,8 +1807,9 @@ class TokenBrowser:
                         }));
                         window.scrollTo(0, Math.min(320, document.body?.scrollHeight || 320));
                     } catch (e) {}
-                })()
-                """
+                }
+                """,
+                self._should_activate_browser_window(),
             )
         except Exception:
             pass
@@ -1440,11 +1818,13 @@ class TokenBrowser:
             getattr(config, "browser_flow_page_warmup_seconds", 6) or 6
         )
         if warmup_seconds > 0:
+            self._record_captcha_stage("page_warmup")
             debug_logger.log_info(
                 f"[BrowserCaptcha] Token-{self.token_id} {label}真实页面预热 {warmup_seconds:.1f}s"
             )
             await asyncio.sleep(warmup_seconds)
 
+        self._record_captcha_stage("recaptcha_readiness")
         ready = await self._wait_for_enterprise_ready(
             page,
             website_key,
@@ -1454,7 +1834,17 @@ class TokenBrowser:
             context_label=f"{label}真实页面",
         )
         if not ready:
-            return False
+            state = await self._capture_captcha_page_state(page)
+            self._record_captcha_stage("recaptcha_readiness", **state)
+            if state.get("location") == "google_signin" or state.get("login_link"):
+                raise self._captcha_failure("login_required")
+            if state.get("location") == "flow_landing":
+                raise self._captcha_failure("flow_editor_unavailable")
+            raise self._captcha_failure("recaptcha_unavailable")
+
+        # The account may redirect during warmup or captcha initialization.
+        # Reconfirm the same visible input before handing the page to submit.
+        await self._ensure_flow_editor(page)
 
         await self._capture_page_fingerprint(page)
         try:
@@ -1520,17 +1910,23 @@ class TokenBrowser:
         width = self._profile_viewport["width"]
         height = self._profile_viewport["height"]
         viewport = {"width": width, "height": height}
-        launch_in_background = bool(getattr(config, "browser_launch_background", True))
+        launch_in_background = not self._should_activate_browser_window()
 
         if manage_slot_pid:
             await self._cleanup_stale_slot_process()
-        playwright = await async_playwright().start()
+        self._record_captcha_stage(
+            "browser_launch", platform=sys.platform,
+            custom_executable=bool(os.environ.get("BROWSER_EXECUTABLE_PATH", "").strip()),
+        )
         browser_executable_path = (
             os.environ.get("BROWSER_EXECUTABLE_PATH", "").strip() or None
         )
         proxy_option, raw_proxy_url, _ = await self._resolve_proxy_runtime_config(
             token_proxy_url=token_proxy_url
         )
+        # Resolve database-backed proxy settings before owning a driver process;
+        # cancellation during that lookup must not leave an untracked runtime.
+        playwright = await async_playwright().start()
 
         # 先只记录代理，真实 UA/UA-CH 交给浏览器自己暴露，避免 user-agent 与 sec-ch-ua 版本错位。
         self._last_fingerprint = {
@@ -1599,13 +1995,13 @@ class TokenBrowser:
                 f"[BrowserCaptcha] Token-{self.token_id} shared browser started (proxy={'yes' if raw_proxy_url else 'no'})"
             )
             return playwright, browser, context
-        except Exception as e:
+        except BaseException as e:
             debug_logger.log_error(
                 f"[BrowserCaptcha] Token-{self.token_id} browser launch failed: {type(e).__name__}: {str(e)[:200]}"
             )
             try:
                 if playwright:
-                    await playwright.stop()
+                    await asyncio.wait_for(playwright.stop(), timeout=3)
             except Exception:
                 pass
             if manage_slot_pid:
@@ -1739,8 +2135,11 @@ class TokenBrowser:
             playwright, browser, context = await self._create_browser(
                 token_proxy_url=token_proxy_url
             )
-            binding_ok = await self._ensure_shared_token_binding(context, token_id)
-            if not binding_ok:
+            try:
+                binding_ok = await self._ensure_shared_token_binding(context, token_id)
+                if not binding_ok:
+                    raise self._captcha_failure("cookie_binding_failed")
+            except BaseException:
                 await self._close_browser(
                     playwright,
                     browser,
@@ -1748,7 +2147,7 @@ class TokenBrowser:
                     browser_pid=self._extract_browser_pid(browser),
                     clear_slot_pid=True,
                 )
-                raise RuntimeError("failed to bind token session context")
+                raise
             self._shared_playwright = playwright
             self._shared_browser = browser
             self._shared_context = context
@@ -2139,18 +2538,24 @@ class TokenBrowser:
         1. 打开项目页并处理引导弹窗；
         2. 在 ProseMirror 输入框输入占位提示词并点击 Start generation，
            页面在自己的调用上下文中 execute 出无标记 token；
-        3. route 拦截 StreamChat 请求，提取 token 与会话 id 后 abort，
+        3. route 拦截 StreamChat 或生成 batchexecute RPC，abort 后提取 token 与会话 id，
            请求不会发往服务端，token 保持未消费状态供主程序提交使用。
         """
         page = None
         self._harvest_streamchat_post = None
+        self._harvest_rpc = None
         self._last_harvest_session_id = None
+        self._harvest_route_error = None
         debug_logger.log_info(
             f"[BrowserCaptcha] Token-{self.token_id} harvest 开始: "
             f"project={project_id} action={action}"
         )
         try:
-            page = await context.new_page()
+            self._record_captcha_stage("page_creation")
+            page = await self._new_page(context)
+            page.on("pageerror", lambda error: self._record_captcha_stage(
+                self._captcha_stage, self._classify_captcha_error(error)
+            ))
             await self._apply_browser_environment_patch(page, label="captcha_page")
             await page.add_init_script(
                 "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
@@ -2163,31 +2568,34 @@ class TokenBrowser:
                 context_label="打码",
             )
             if not ready:
-                debug_logger.log_warning(
-                    f"[BrowserCaptcha] Token-{self.token_id} harvest 页面未就绪: "
-                    f"url={page.url[:80]}"
-                )
-                return None
+                raise self._captcha_failure("flow_page_unavailable")
 
-            harvest_result = await asyncio.wait_for(
-                self._harvest_token_via_ui_submit(page),
-                timeout=120,
-            )
+            harvest_result = await self._harvest_token_via_ui_submit(page)
+            if self._harvest_route_error:
+                raise self._captcha_failure(self._harvest_route_error)
             if not harvest_result or not harvest_result.get("token"):
-                return None
+                raise self._captcha_failure("captcha_missing")
             self._last_harvest_session_id = harvest_result.get("session_id")
+            self._last_fingerprint = {
+                **(self._last_fingerprint or {}),
+                "harvest_transport": harvest_result["transport"],
+                "harvest_rpc": harvest_result["rpc"],
+            }
+            self._record_captcha_stage("complete")
             return harvest_result.get("token")
+        except BrowserCaptchaError:
+            raise
         except Exception as e:
-            msg = f"{type(e).__name__}: {str(e)}"
-            debug_logger.log_warning(
-                f"[BrowserCaptcha] Token-{self.token_id} 打码失败: {msg[:200]}"
-            )
-            return None
+            if page:
+                self._record_captcha_stage(self._captcha_stage, **await self._capture_captcha_page_state(page))
+            raise self._captcha_failure(
+                self._harvest_route_error or self._classify_captcha_error(e)
+            ) from None
         finally:
             if page:
                 try:
-                    await page.close()
-                except:
+                    await asyncio.wait_for(page.close(), timeout=3)
+                except Exception:
                     pass
 
     HARVEST_PROMPT_POOL = (
@@ -2245,77 +2653,52 @@ class TokenBrowser:
             return
 
     async def _harvest_token_via_ui_submit(self, page) -> Optional[Dict[str, Any]]:
-        """驱动页面 UI 提交一次生成并从被拦截的请求中提取 token / 会话 id。
-
-        全新浏览器 context 没有本地引导状态，项目页可能反复弹出多步
-        引导弹窗（Previous/Continue 等）吞掉编辑器内容，因此输入与提交
-        都需要校验并重试，提交后在等待窗口内持续关闭后出现的弹窗。
-        """
+        """Submit through the native UI, with supported generation RPCs intercepted."""
+        self._record_captcha_stage("onboarding")
         await self._dismiss_flow_overlays(page)
-        await page.wait_for_timeout(2500)
-
-        editor = page.locator(".ProseMirror").first
+        self._record_captcha_stage("editor_wait")
+        editor = page.locator(".ProseMirror:visible").first
         try:
-            await editor.wait_for(timeout=30000)
-        except Exception as e:
-            debug_logger.log_warning(
-                f"[BrowserCaptcha] Token-{self.token_id} 未找到 ProseMirror 输入框: "
-                f"{type(e).__name__}: {str(e)[:150]} url={page.url[:80]}"
-            )
-            return None
+            await editor.wait_for(timeout=15000)
+        except Exception:
+            state = await self._capture_captcha_page_state(page)
+            self._record_captcha_stage("editor_wait", **state)
+            raise self._captcha_failure(
+                "login_required" if state.get("location") == "google_signin" or state.get("login_link")
+                else "editor_missing"
+            ) from None
 
         harvest_prompt = random.choice(self.HARVEST_PROMPT_POOL)
-        prompt_head = harvest_prompt[:24]
         submitted = False
-        for round_index in range(4):
+        for _ in range(2):
+            self._record_captcha_stage("editor_input")
             try:
-                current_text = await editor.inner_text()
-            except Exception:
-                current_text = ""
-            if prompt_head not in current_text:
-                try:
-                    await editor.click(timeout=4000)
-                    await page.keyboard.press("Control+a")
-                except Exception:
-                    await self._dismiss_flow_overlays(page, rounds=4)
-                    await page.wait_for_timeout(800)
-                    continue
-                try:
-                    await editor.type(harvest_prompt, delay=30)
-                except Exception as e:
-                    debug_logger.log_warning(
-                        f"[BrowserCaptcha] Token-{self.token_id} 输入提示词失败: "
-                        f"{type(e).__name__}: {str(e)[:150]}"
-                    )
-                    return None
-                # 输入过程中可能再次弹出引导弹窗，关闭后确认文本仍在
+                # fill targets this contenteditable directly and replaces all text
+                # on every OS. Control+A does not select all on macOS.
+                await editor.fill(harvest_prompt, timeout=4000)
                 await self._dismiss_flow_overlays(page, rounds=2)
-                try:
-                    current_text = await editor.inner_text()
-                except Exception:
-                    current_text = ""
-                debug_logger.log_info(
-                    f"[BrowserCaptcha] Token-{self.token_id} harvest 第{round_index + 1}轮"
-                    f"输入确认: {'ok' if prompt_head in current_text else 'lost'}"
-                )
-                if prompt_head not in current_text:
+                if (await editor.inner_text(timeout=4000)).strip() != harvest_prompt:
                     continue
+            except Exception:
+                await self._dismiss_flow_overlays(page, rounds=2)
+                continue
 
-            submit_button = page.locator(
-                "button[aria-label='Start generation']"
-            ).first
+            self._record_captcha_stage("submit_button")
+            submit_button = page.locator("button[aria-label='Start generation']:visible").first
             try:
                 await submit_button.click(timeout=8000)
                 submitted = True
-            except Exception as e:
-                debug_logger.log_warning(
-                    f"[BrowserCaptcha] Token-{self.token_id} 点击 Start generation 失败"
-                    f"（第{round_index + 1}轮）: {type(e).__name__}: {str(e)[:150]}"
-                )
-                await self._dismiss_flow_overlays(page, rounds=4)
+            except Exception:
+                if self._harvest_route_error:
+                    raise self._captcha_failure(self._harvest_route_error)
+                self._record_captcha_stage("submit_button", **await self._capture_captcha_page_state(page))
+                await self._dismiss_flow_overlays(page, rounds=2)
                 continue
 
-            for tick in range(30):
+            self._record_captcha_stage("request_interception")
+            for tick in range(20):
+                if self._harvest_route_error:
+                    raise self._captcha_failure(self._harvest_route_error)
                 if self._harvest_streamchat_post:
                     break
                 await page.wait_for_timeout(1000)
@@ -2323,66 +2706,68 @@ class TokenBrowser:
                     await self._dismiss_flow_overlays(page, rounds=1)
             if self._harvest_streamchat_post:
                 break
-            debug_logger.log_info(
-                f"[BrowserCaptcha] Token-{self.token_id} harvest 第{round_index + 1}轮"
-                "未捕获到请求，重试"
-            )
 
         post_data = self._harvest_streamchat_post
-        debug_logger.log_info(
-            f"[BrowserCaptcha] Token-{self.token_id} harvest 捕获: "
-            f"{'len=' + str(len(post_data)) if post_data else 'NONE'} submitted={submitted}"
-        )
         if not post_data:
-            try:
-                dbg = await page.evaluate(
-                    """() => ({
-                        url: location.href,
-                        editorText: (document.querySelector('.ProseMirror')||{}).innerText?.slice(0,60),
-                        submitDisabled: (document.querySelector("button[aria-label='Start generation']")||{}).disabled,
-                        overlayButtons: [...document.querySelectorAll('.cdk-overlay-container button')].map(b => b.innerText.slice(0,20)).slice(0,5),
-                        generating: !!document.querySelector('stop-generation, [aria-label*=Stop]'),
-                    })"""
-                )
-                debug_logger.log_warning(
-                    f"[BrowserCaptcha] Token-{self.token_id} 未捕获页面 StreamChat 请求，"
-                    f"页面状态: {dbg}"
-                )
-            except Exception:
-                pass
-        if not post_data:
-            return None
+            self._record_captcha_stage(self._captcha_stage, **await self._capture_captcha_page_state(page))
+            raise self._captcha_failure("generation_request_missing" if submitted else "submit_unavailable")
 
+        self._record_captcha_stage("request_parse")
+        rpc = self._harvest_rpc or "StreamChat"
         try:
-            decoded = unquote(post_data)
-            token_match = re.search(
-                r'\[\\?"(0cAFcW[A-Za-z0-9_\-]+)\\?"', decoded
+            # Split form fields before URL decoding, otherwise an encoded '&' in
+            # the JSON truncates f.req and silently loses the captured token.
+            freq_raw = parse_qs(post_data, keep_blank_values=True)["f.req"][0]
+            outer = json.loads(freq_raw)
+            self._record_captcha_stage(
+                "request_envelope", harvest_rpc=rpc,
+                payload_shape=self._harvest_payload_shape(outer),
             )
-            session_id = None
-            freq_raw = decoded[len("f.req="):]
-            amp_index = freq_raw.find("&")
-            outer = json.loads(
-                freq_raw[:amp_index] if amp_index >= 0 else freq_raw
+            if rpc != "StreamChat":
+                row = next(row for row in self._harvest_batch_rows(post_data) if row[0] == rpc)
+                inner = json.loads(row[1])
+            else:
+                inner = json.loads(outer[1])
+            self._record_captcha_stage(
+                "request_parse", harvest_rpc=rpc,
+                harvest_transport="streamchat" if rpc == "StreamChat" else "batchexecute",
+                payload_shape=self._harvest_payload_shape(inner),
             )
-            inner = json.loads(outer[1])
-            if isinstance(inner, list) and inner:
-                session_id = str(inner[0] or "") or None
-        except Exception as e:
-            debug_logger.log_warning(
-                f"[BrowserCaptcha] Token-{self.token_id} 解析 StreamChat 请求体失败: "
-                f"{type(e).__name__}: {str(e)[:150]}"
-            )
-            return None
-        if not token_match:
-            debug_logger.log_warning(
-                f"[BrowserCaptcha] Token-{self.token_id} StreamChat 请求体中未找到 token"
-            )
-            return None
-        debug_logger.log_info(
-            f"[BrowserCaptcha] Token-{self.token_id} harvest 成功: "
-            f"token_len={len(token_match.group(1))} session={session_id or 'n/a'}"
-        )
-        return {"token": token_match.group(1), "session_id": session_id}
+            if rpc == "YhhmEf":
+                raise self._captcha_failure("generation_rpc_unsupported")
+            if rpc == "ogiZ0b":
+                captcha_token = inner[3][10][0]
+                session_id = inner[4][0]
+                if not all(isinstance(node, list) for node in (inner, inner[3], inner[3][10], inner[4])):
+                    raise ValueError("invalid image generation context shape")
+                if not isinstance(captcha_token, str) or not captcha_token.strip():
+                    raise self._captcha_failure("captcha_missing_in_request")
+                if not isinstance(session_id, str) or not session_id.strip():
+                    raise self._captcha_failure("session_missing_in_request")
+                return {"token": captcha_token, "session_id": session_id, "transport": "batchexecute", "rpc": rpc}
+            # The captured StreamChat schema matches _build_stream_chat_request:
+            # [session_id, prompt_messages, [project, null, [captcha, 1], ...]].
+            # Tokens are opaque strings; prefixes can change and regex searching
+            # the entire request can accidentally select text from the prompt.
+            if not isinstance(inner, list) or len(inner) < 3:
+                raise ValueError("invalid inner shape")
+            client_context = inner[2]
+            if not isinstance(client_context, list) or len(client_context) < 3:
+                raise ValueError("invalid client context shape")
+            captcha_context = client_context[2]
+            if not isinstance(captcha_context, list):
+                raise ValueError("invalid captcha context shape")
+            captcha_token = captcha_context[0] if captcha_context else None
+            session_id = inner[0]
+        except BrowserCaptchaError:
+            raise
+        except Exception:
+            raise self._captcha_failure("generation_payload_invalid") from None
+        if not isinstance(captcha_token, str) or not captcha_token.strip():
+            raise self._captcha_failure("captcha_missing_in_request")
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise self._captcha_failure("session_missing_in_request")
+        return {"token": captcha_token, "session_id": session_id, "transport": "streamchat", "rpc": rpc}
 
     def get_last_harvest_session_id(self) -> Optional[str]:
         """返回最近一次 harvest 得到的 Flow 会话 id（供主程序提交复用）。"""
@@ -2400,7 +2785,7 @@ class TokenBrowser:
         """在任意站点执行 reCAPTCHA，用于分数测试等非 Flow 场景。"""
         page = None
         try:
-            page = await context.new_page()
+            page = await self._new_page(context)
             await self._apply_browser_environment_patch(
                 page, label="custom_captcha_page"
             )
@@ -2490,16 +2875,17 @@ class TokenBrowser:
                     f"[BrowserCaptcha] Token-{self.token_id} 自定义页面 readyState 未达到 complete，继续尝试预热"
                 )
 
-            # 模拟更自然的前台交互，避免冷启动空白上下文直接 execute。
+            # 页面内交互不需要激活系统前台窗口。
             try:
                 await page.mouse.move(320, 220)
                 await page.mouse.move(520, 320, steps=12)
                 await page.mouse.wheel(0, 240)
-                await page.bring_to_front()
+                if self._should_activate_browser_window():
+                    await page.bring_to_front()
                 await page.evaluate("""
-                    (() => {
+                    (allowWindowFocus) => {
                         try {
-                            window.focus();
+                            if (allowWindowFocus) window.focus();
                             window.dispatchEvent(new Event('focus'));
                             document.dispatchEvent(new MouseEvent('mousemove', {
                                 bubbles: true,
@@ -2508,8 +2894,8 @@ class TokenBrowser:
                             }));
                             window.scrollTo(0, Math.min(280, document.body?.scrollHeight || 280));
                         } catch (e) {}
-                    })()
-                """)
+                    }
+                """, self._should_activate_browser_window())
             except Exception:
                 pass
 
@@ -2675,49 +3061,112 @@ class TokenBrowser:
         try:
             await page.evaluate(
                 """
-                (primaryUrl, secondaryUrl) => {
-                    const existing = Array.from(document.scripts || []).some((script) => {
-                        const src = script?.src || "";
-                        return src.includes('/recaptcha/enterprise.js');
-                    });
-                    if (existing) return;
+                ([primaryUrl, secondaryUrl]) => {
                     const urls = [primaryUrl, secondaryUrl];
+                    const stateKey = '__flow2apiRecaptchaBootstrapState';
+                    const state = window[stateKey] || (window[stateKey] = {
+                        status: 'idle', url: '', error: '', attempts: 0,
+                    });
+                    if (state.status === 'loading') return;
+                    const nonceSource = document.querySelector('script[nonce]');
+                    const scriptNonce = nonceSource
+                        ? (nonceSource.nonce || nonceSource.getAttribute('nonce') || '')
+                        : '';
+                    const trustedScriptURL = (url) => {
+                        if (!window.trustedTypes) return url;
+                        const policyKey = '__flow2apiRecaptchaTrustedPolicies';
+                        const policies = window[policyKey] || (window[policyKey] = new Map());
+                        const signature = JSON.stringify(urls);
+                        let policy = policies.get(signature);
+                        if (!policy) {
+                            const allowedUrls = new Set(urls);
+                            policy = window.trustedTypes.createPolicy(
+                                `flow2api-recaptcha-bootstrap-${policies.size}`,
+                                {
+                                    createScriptURL: (value) => {
+                                        const candidate = String(value);
+                                        if (!allowedUrls.has(candidate)) {
+                                            throw new TypeError('reCAPTCHA script URL is not allowed');
+                                        }
+                                        return candidate;
+                                    },
+                                },
+                            );
+                            policies.set(signature, policy);
+                        }
+                        return policy.createScriptURL(url);
+                    };
+                    const parent = document.head || document.documentElement || document.body;
+                    if (!parent) {
+                        state.status = 'error';
+                        state.error = 'missing script parent';
+                        return;
+                    }
                     const loadScript = (index) => {
-                        if (index >= urls.length) return;
+                        if (index >= urls.length) {
+                            state.status = 'error';
+                            if (!state.error) state.error = 'all candidate urls exhausted';
+                            return;
+                        }
+                        state.status = 'loading';
+                        state.url = urls[index];
+                        state.error = '';
+                        state.attempts = Number(state.attempts || 0) + 1;
                         const script = document.createElement('script');
-                        script.src = urls[index];
                         script.async = true;
-                        script.onerror = () => loadScript(index + 1);
-                        document.head.appendChild(script);
+                        let settled = false;
+                        let timer = null;
+                        const finish = (status, error = '') => {
+                            if (settled) return;
+                            settled = true;
+                            state.status = status;
+                            state.error = String(error);
+                        };
+                        script.onload = () => {
+                            if (settled) return;
+                            clearTimeout(timer);
+                            finish('loaded');
+                        };
+                        script.onerror = () => {
+                            if (settled) return;
+                            clearTimeout(timer);
+                            script.remove();
+                            finish('error', `script load error: ${urls[index]}`);
+                            loadScript(index + 1);
+                        };
+                        try {
+                            if (scriptNonce) script.nonce = scriptNonce;
+                            script.src = trustedScriptURL(urls[index]);
+                            timer = setTimeout(() => {
+                                if (settled) return;
+                                script.remove();
+                                finish('error', `script load timeout: ${urls[index]}`);
+                                loadScript(index + 1);
+                            }, 8000);
+                            parent.appendChild(script);
+                        } catch (error) {
+                            clearTimeout(timer);
+                            script.remove();
+                            finish('error', error && error.message ? error.message : String(error));
+                            loadScript(index + 1);
+                        }
                     };
                     loadScript(0);
                 }
                 """,
-                f"{primary_host}/recaptcha/enterprise.js?render={website_key}",
-                f"{secondary_host}/recaptcha/enterprise.js?render={website_key}",
+                [
+                    f"{primary_host}/recaptcha/enterprise.js?render={website_key}&trustedtypes=true",
+                    f"{secondary_host}/recaptcha/enterprise.js?render={website_key}&trustedtypes=true",
+                ],
             )
-            await page.wait_for_function(wait_expression, timeout=timeout_ms)
+            # Allow both 8-second candidates and the loader's gstatic dependency.
+            await page.wait_for_function(wait_expression, timeout=max(timeout_ms, 20000))
             return True
         except Exception as inject_error:
             debug_logger.log_warning(
-                f"[BrowserCaptcha] Token-{self.token_id} {label}页面内注入失败"
-                f"（新版 CSP 会拒绝动态 script），改用 Playwright add_script_tag: "
+                f"[BrowserCaptcha] Token-{self.token_id} {label}页面内补注入后 grecaptcha 未就绪: "
                 f"{type(inject_error).__name__}: {str(inject_error)[:150]}"
             )
-
-        # 最终兜底：Playwright add_script_tag（配合 CSP 剥除 route 生效）
-        for script_host in (primary_host, secondary_host):
-            try:
-                await page.add_script_tag(
-                    url=f"{script_host}/recaptcha/enterprise.js?render={website_key}"
-                )
-                await page.wait_for_function(wait_expression, timeout=timeout_ms)
-                return True
-            except Exception as tag_error:
-                debug_logger.log_warning(
-                    f"[BrowserCaptcha] Token-{self.token_id} {label}add_script_tag({script_host}) 失败: "
-                    f"{type(tag_error).__name__}: {str(tag_error)[:150]}"
-                )
         return False
 
     @staticmethod
@@ -2766,7 +3215,7 @@ class TokenBrowser:
                             token_id=token_id,
                         )
 
-                        page = await context.new_page()
+                        page = await self._new_page(context)
                         await self._apply_browser_environment_patch(
                             page, label="browser_submit_page"
                         )
@@ -2934,68 +3383,61 @@ class TokenBrowser:
         token_proxy_url: Optional[str] = None,
         token_id: Optional[int] = None,
     ) -> tuple[Optional[str], Optional[str]]:
-        """Get a token from the shared browser unless a fatal browser error occurs."""
+        """Bound both slot waiting and the complete native captcha operation."""
+        try:
+            return await asyncio.wait_for(
+                self._get_token_with_retries(
+                    project_id, website_key, action, token_proxy_url, token_id
+                ),
+                timeout=self.CAPTCHA_REQUEST_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            raise BrowserCaptchaError("request_deadline", "timeout") from None
+
+    async def _get_token_with_retries(
+        self, project_id, website_key, action, token_proxy_url, token_id
+    ) -> tuple[Optional[str], Optional[str]]:
         async with self._semaphore:
             self._solve_inflight += 1
-            max_retries = 3
+            self._captcha_started_at = time.monotonic()
+            self._captcha_diagnostics = []
+            self._record_captcha_stage("browser_acquisition", platform=sys.platform)
+
+            async def solve_once():
+                _, _, context = await self._get_or_create_shared_browser(
+                    token_proxy_url=token_proxy_url, token_id=token_id,
+                )
+                self._record_captcha_stage("context_ready", proxy_active=self._browser_proxy_active)
+                return await self._execute_captcha(context, project_id, website_key, action)
 
             try:
-                for attempt in range(max_retries):
+                for attempt in range(2):
                     try:
-                        start_ts = time.time()
-                        _, _, context = await self._get_or_create_shared_browser(
-                            token_proxy_url=token_proxy_url,
-                            token_id=token_id,
+                        # Includes launch, cookie binding, navigation, readiness and
+                        # UI. Previously only the final UI step had a timeout, and
+                        # its 120 seconds were repeated by nested retry loops.
+                        token = await asyncio.wait_for(
+                            solve_once(), timeout=self.CAPTCHA_SOLVE_TIMEOUT_SECONDS,
                         )
-
-                        token = await self._execute_captcha(
-                            context, project_id, website_key, action
-                        )
-                        if token:
-                            self._solve_count += 1
-                            self._consecutive_browser_failures = 0
-                            debug_logger.log_info(
-                                f"[BrowserCaptcha] Token-{self.token_id} token acquired ({(time.time()-start_ts)*1000:.0f}ms, launches={self._shared_launch_count}, reuse={self._shared_reuse_count})"
-                            )
-                            return token, self._last_harvest_session_id
-
+                        if not token:
+                            raise self._captcha_failure("captcha_missing")
+                        self._solve_count += 1
+                        self._consecutive_browser_failures = 0
+                        return token, self._last_harvest_session_id
+                    except Exception as error:
                         self._error_count += 1
                         self._consecutive_browser_failures += 1
-                        debug_logger.log_warning(
-                            f"[BrowserCaptcha] Token-{self.token_id} token attempt {attempt + 1}/{max_retries} failed"
+                        failure = error if isinstance(error, BrowserCaptchaError) else self._captcha_failure(
+                            self._classify_captcha_error(error)
                         )
-                        if self._consecutive_browser_failures >= 2:
-                            await self.recycle_browser(
-                                reason=f"captcha_failed_{attempt + 1}",
-                                rotate_profile=False,
-                            )
-                    except Exception as e:
-                        self._error_count += 1
-                        self._consecutive_browser_failures += 1
-                        error_message = f"{type(e).__name__}: {str(e)}"
-                        debug_logger.log_error(
-                            f"[BrowserCaptcha] Token-{self.token_id} browser error: {error_message[:200]}"
-                        )
-                        error_lower = error_message.lower()
-                        if any(
-                            keyword in error_lower
-                            for keyword in [
-                            "context or browser has been closed",
-                            "target closed",
-                            "browser has been closed",
-                            "connection closed",
-                            "crash",
-                            "closed",
-                            ]
-                        ):
-                            await self.recycle_browser(
-                                reason="browser_runtime_error", rotate_profile=False
-                            )
-
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(1)
-
-                return None, None
+                        # Repeating login/UI/schema failures cannot repair them.
+                        # Retry only a disconnected browser or transient network.
+                        if attempt or failure.reason not in {
+                            "browser_closed", "network_connection_failed", "dns_failed",
+                        }:
+                            raise failure from None
+                        await self.recycle_browser(reason="captcha_runtime_failure", rotate_profile=False)
+                raise self._captcha_failure("captcha_missing")
             finally:
                 self._solve_inflight = max(0, self._solve_inflight - 1)
                 self.note_idle()
@@ -3436,7 +3878,144 @@ class BrowserCaptchaService:
             )
         return None
     
+    async def generate_image(
+        self,
+        project_id: str,
+        token_id: Optional[int],
+        prompt: str,
+        model_name: str,
+        aspect_ratio: str,
+        image_inputs: Optional[List[Dict[str, Any]]] = None,
+        timeout: float = 120,
+        on_generation_sent=None,
+    ) -> Dict[str, Any]:
+        """Keep one bound browser slot locked through its native image response."""
+        return await self._generate_native_media(
+            "image", project_id, token_id,
+            {"prompt": prompt, "model_name": model_name, "aspect_ratio": aspect_ratio,
+             "image_inputs": image_inputs or []},
+            timeout,
+            **({"on_generation_sent": on_generation_sent} if on_generation_sent is not None else {}),
+        )
+
+    async def generate_video(
+        self,
+        project_id: str,
+        token_id: Optional[int],
+        prompt: str,
+        model_key: str,
+        aspect_ratio: str,
+        timeout: float = 120,
+        mode: str = "text",
+        frame_images: Optional[List[bytes]] = None,
+        resolution: Optional[str] = None,
+        on_generation_sent=None,
+    ) -> Dict[str, Any]:
+        """Submit once from the bound browser and retain its slot until response."""
+        return await self._generate_native_media(
+            "video", project_id, token_id,
+            {"prompt": prompt, "model_key": model_key, "aspect_ratio": aspect_ratio,
+             "mode": mode, "frame_images": frame_images or [], "resolution": resolution},
+            timeout,
+            **({"on_generation_sent": on_generation_sent} if on_generation_sent is not None else {}),
+        )
+
+    async def _generate_native_media(
+        self, media_type: str, project_id: str, token_id: Optional[int],
+        spec: Dict[str, Any], timeout: float,
+        on_generation_sent=None,
+    ) -> Dict[str, Any]:
+        """Share pool admission, account binding and cleanup for native submits."""
+        self._check_available()
+        try:
+            request_timeout = float(timeout)
+            if not 0 < request_timeout < float("inf"):
+                raise ValueError("invalid timeout")
+        except (TypeError, ValueError):
+            raise BrowserCaptchaError(f"native_{media_type}_setup", "invalid_timeout") from None
+        deadline = time.monotonic() + request_timeout
+        self._stats["req_total"] += 1
+
+        async def use_slot():
+            browser_id = None
+            try:
+                browser_id = await self._select_browser_id(project_id)
+                browser = await self._get_or_create_browser(browser_id)
+                async with browser._semaphore:
+                    browser._solve_inflight += 1
+                    browser._captcha_started_at = time.monotonic()
+                    browser._captcha_diagnostics = []
+                    try:
+                        browser._record_captcha_stage("native_browser_acquisition")
+                        token_proxy_url = await self._resolve_token_proxy_url(token_id)
+                        _, _, context = await browser._get_or_create_shared_browser(
+                            token_proxy_url=token_proxy_url, token_id=token_id,
+                        )
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise BrowserCaptchaError(f"native_{media_type}_deadline", "timeout")
+                        if media_type == "video":
+                            from .native_video_submission import submit_native_video as submit_native
+                        else:
+                            from .native_image_submission import submit_native_image as submit_native
+
+                        result = await submit_native(
+                            browser, context, project_id,
+                            {**deepcopy(spec), "website_key": self.website_key},
+                            timeout=remaining,
+                            **({"on_generation_sent": on_generation_sent} if on_generation_sent is not None else {}),
+                        )
+                        browser._solve_count += 1
+                        browser._consecutive_browser_failures = 0
+                        return {**result, "fingerprint": browser.get_last_fingerprint()}
+                    except Exception as error:
+                        browser._error_count += 1
+                        browser._consecutive_browser_failures += 1
+                        if isinstance(error, BrowserCaptchaError):
+                            raise
+                        raise browser._captcha_failure(browser._classify_captcha_error(error)) from None
+                    finally:
+                        browser._solve_inflight = max(0, browser._solve_inflight - 1)
+                        browser.note_idle()
+            finally:
+                if browser_id is not None:
+                    await self._release_slot_reservation(browser_id)
+
+        async def schedule():
+            if self._token_semaphore is None:
+                return await use_slot()
+            async with self._token_semaphore:
+                return await use_slot()
+
+        try:
+            # One total budget includes admission, account binding and response.
+            # The submit helper bounds page cleanup on cancellation separately.
+            result = await asyncio.wait_for(schedule(), timeout=request_timeout)
+        except asyncio.TimeoutError:
+            self._stats["gen_fail"] += 1
+            raise BrowserCaptchaError(f"native_{media_type}_deadline", "timeout") from None
+        except BaseException:
+            self._stats["gen_fail"] += 1
+            raise
+        else:
+            self._stats["gen_ok"] += 1
+            return result
+        finally:
+            self._log_stats()
+
     async def get_token(
+        self, project_id: str, action: str = "IMAGE_GENERATION", token_id: int = None
+    ) -> tuple[Optional[str], Union[int, str], Optional[Dict[str, Any]]]:
+        # Include pool admission and slot reservation in the total request budget.
+        try:
+            return await asyncio.wait_for(
+                self._get_token_from_pool(project_id, action, token_id),
+                timeout=TokenBrowser.CAPTCHA_REQUEST_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            raise BrowserCaptchaError("pool_deadline", "timeout") from None
+
+    async def _get_token_from_pool(
         self, project_id: str, action: str = "IMAGE_GENERATION", token_id: int = None
     ) -> tuple[Optional[str], Union[int, str], Optional[Dict[str, Any]]]:
         """获取 reCAPTCHA Token（从共享浏览器池选择 slot）

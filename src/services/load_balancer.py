@@ -1,7 +1,12 @@
 """Load balancing module for Flow2API"""
 
 import asyncio
+import math
 import random
+import re
+import time
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Optional, Dict
 from ..core.models import Token
 from ..core.config import config
@@ -13,6 +18,19 @@ from ..core.account_tiers import (
 )
 from .concurrency_manager import ConcurrencyManager
 from ..core.logger import debug_logger
+from .captcha_errors import BrowserCaptchaError
+from .flow_frontend import FlowRPCRejected
+from .token_manager import TokenManager
+
+
+@dataclass
+class _GenerationCooldown:
+    identity: str
+    reason: str
+    failures: int
+    retry_after: float
+    last_failure: float
+    account: str = ""
 
 
 class LoadBalancer:
@@ -26,12 +44,175 @@ class LoadBalancer:
         self._image_pending: Dict[int, int] = {}
         self._video_pending: Dict[int, int] = {}
         self._pending_lock = asyncio.Lock()
+        self._pending_selection_lock = asyncio.Lock()
         self._round_robin_state: Dict[str, Optional[int]] = {
             "image": None,
             "video": None,
             "default": None,
         }
         self._rr_lock = asyncio.Lock()
+        self._selection_health = ContextVar("selection_health", default=None)
+        self._generation_cooldowns: dict[tuple[int, str, Optional[str], str], _GenerationCooldown] = {}
+
+    @staticmethod
+    def _generation_scope(for_image_generation: bool, for_video_generation: bool) -> str:
+        return "image" if for_image_generation else ("video" if for_video_generation else "default")
+
+    @staticmethod
+    def _below_video_credit_floor(token: Token) -> bool:
+        """An account that cannot pay for another video only burns an attempt."""
+        floor = getattr(config, "flow_min_video_credits", 10)
+        credits = getattr(token, "credits", None)
+        return bool(floor) and credits is not None and credits < floor
+
+    @staticmethod
+    def _generation_failure_category(error, scope: str, model: Optional[str]):
+        """Only fixed, typed runtime failures affect temporary routing health."""
+        # Routing away from an explicit traffic rejection does not establish
+        # submission acceptance/rejection. Image RPCs have a separate evidence
+        # contract, so do not use or change submission_rejected here.
+        if isinstance(error, FlowRPCRejected) and error.error_code in {
+            "PUBLIC_ERROR_UNUSUAL_ACTIVITY", "PUBLIC_ERROR_UNUSUAL_ACTIVITY_TOO_MUCH_TRAFFIC",
+        }:
+            return "all", None, f"上游流量限制 [{error.error_code}]", 300, 1800
+        if not isinstance(error, BrowserCaptchaError) or error.submission_pending is not False:
+            return None
+        stage, reason = error.stage, error.reason
+        setup_reasons = {f"{phase}_failed" for phase in (
+            "open", "summary_find", "summary_click", "panel_wait", "mode", "model",
+            "duration", "submode", "resolution", "ratio", "count", "save",
+            "verify_mode", "verify_model", "verify_duration", "verify_ratio", "verify_count",
+        )}
+        if stage == "native_generation_setup" and reason in setup_reasons:
+            model_scope = model if reason in {"model_failed", "verify_model_failed", "resolution_failed"} else None
+        elif stage == "native_frame_upload" and re.fullmatch(r"(?:frame_[12]_(?:open|chooser|binding|bound)_failed|frame_slots_failed|initial_slots_not_empty|other_slot_changed|uploaded_asset_mismatch|frame_binding_changed)", reason):
+            model_scope = None
+        elif stage in {
+            "navigation", "page_loaded", "editor_readiness", "editor_wait", "editor_input", "submit_button",
+            "page_warmup", "recaptcha_readiness", "native_page_prepare", "native_page_prepare_retry",
+            "native_editor_input", "native_submit_prepare", "native_submit",
+        } and reason in {
+            "browser_operation_failed", "navigation_failed", "timeout", "flow_editor_unavailable",
+            "flow_page_unavailable", "prompt_input_mismatch", "prompt_changed_during_upload",
+            "submit_unavailable", "proxy_connection_failed", "editor_missing",
+            "network_empty_response", "network_connection_failed", "navigation_interrupted",
+            "submit_control_missing", "submit_control_not_ready",
+        }:
+            model_scope = None
+        else:
+            return None
+        return scope, model_scope, f"浏览器生成准备不可用 [{stage}/{reason}]", 60, 600
+
+    async def record_generation_failure(
+        self, token_id: int, error, *, for_image_generation: bool = False,
+        for_video_generation: bool = False, model: Optional[str] = None,
+        token: Optional[Token] = None,
+    ) -> bool:
+        """Temporarily route new work away from a failed account/capability.
+
+        This changes neither account activation nor accepted operation state.
+        Each expired circuit permits normal selection again; repeat failures
+        back off within a bounded window instead of permanently banning it.
+        """
+        scope = self._generation_scope(for_image_generation, for_video_generation)
+        category = self._generation_failure_category(error, scope, model)
+        if category is None:
+            return False
+        if token is None:
+            token = await self.token_manager.get_token(token_id)
+        if token is None:
+            return False
+        scope, model_scope, reason, base_seconds, max_seconds = category
+        identity = TokenManager.health_identity(token)
+        account = TokenManager.account_identity(token)
+        # Keep concurrent old/new credential snapshots separate. A late failure
+        # from an old request must not overwrite the current route's circuit.
+        key = (int(token_id), scope, model_scope, identity)
+        now = time.monotonic()
+        self._prune_generation_cooldowns(now)
+        previous_key, previous = key, self._generation_cooldowns.get(key)
+        if previous is None:
+            # Exit rotation moves an account to a new route, and so a new identity,
+            # after each failed generation. The same credentials on another route
+            # continue the streak; otherwise every repeat would restart at the
+            # first step and a persistently failing account is retried too soon.
+            streak = [
+                (other, item) for other, item in self._generation_cooldowns.items()
+                if other[:3] == key[:3] and item.account == account
+            ]
+            if streak:
+                previous_key, previous = max(streak, key=lambda row: row[1].last_failure)
+        failures = 1
+        if previous and now - previous.last_failure <= 3600:
+            failures = min(previous.failures + 1, 6)
+        cooldown_seconds = min(max_seconds, base_seconds * (2 ** (failures - 1)))
+        self._generation_cooldowns.pop(previous_key, None)
+        self._generation_cooldowns[key] = _GenerationCooldown(
+            identity, reason, failures, now + cooldown_seconds, now, account,
+        )
+        # Only fixed categories are logged, never upstream bodies/credentials.
+        debug_logger.logger.warning(
+            "[GENERATION_HEALTH] scope=%s reason=%s decision=cooldown seconds=%s",
+            scope, reason, cooldown_seconds,
+        )
+        return True
+
+    def record_generation_success(
+        self, token_id: int, *, for_image_generation: bool = False,
+        for_video_generation: bool = False, model: Optional[str] = None,
+        token: Optional[Token] = None, started_at: Optional[float] = None,
+    ) -> None:
+        scope = self._generation_scope(for_image_generation, for_video_generation)
+        account = TokenManager.account_identity(token) if token is not None else None
+        scopes = {(int(token_id), "all", None), (int(token_id), scope, None), (int(token_id), scope, model)}
+        for key, cooldown in tuple(self._generation_cooldowns.items()):
+            # Credentials decide whose failure this clears. The route may have
+            # moved on since the request started, which does not undo a success.
+            if key[:3] not in scopes or (account is not None and cooldown.account != account):
+                continue
+            # A previously accepted operation finishing now does not prove a
+            # route recovered from a rejection that happened after it started.
+            if started_at is not None and cooldown.last_failure > started_at:
+                continue
+            self._generation_cooldowns.pop(key, None)
+
+    def _prune_generation_cooldowns(self, now: float) -> None:
+        for key, cooldown in tuple(self._generation_cooldowns.items()):
+            if now - cooldown.last_failure > 3600:
+                self._generation_cooldowns.pop(key, None)
+
+    def get_generation_cooldown_reason(
+        self, token: Token, *, for_image_generation: bool = False,
+        for_video_generation: bool = False, model: Optional[str] = None,
+    ) -> Optional[str]:
+        scope = self._generation_scope(for_image_generation, for_video_generation)
+        identity = TokenManager.health_identity(token)
+        now = time.monotonic()
+        self._prune_generation_cooldowns(now)
+        reasons = []
+        for key in dict.fromkeys(((int(token.id), "all", None, identity), (int(token.id), scope, None, identity), (int(token.id), scope, model, identity))):
+            cooldown = self._generation_cooldowns.get(key)
+            if cooldown is None:
+                continue
+            if cooldown.retry_after > now:
+                remaining = math.ceil(cooldown.retry_after - now)
+                reasons.append(f"{cooldown.reason}（临时冷却，{remaining} 秒后可重试）")
+        return "; ".join(reasons) if reasons else None
+
+    @staticmethod
+    def _selection_unavailable_message(health_failures, cooldown_failures) -> str:
+        if not cooldown_failures:
+            return LoadBalancer._health_unavailable_message(health_failures)
+        return "当前符合条件的账号暂时无法生成：" + "; ".join(dict.fromkeys(
+            cooldown_failures + health_failures
+        ))
+
+    @staticmethod
+    def _health_unavailable_message(reasons) -> str:
+        return (
+            "当前符合条件的账号均未通过上游校验，暂时无法生成："
+            + "; ".join(dict.fromkeys(reason.strip() for reason in reasons))
+        )
 
     async def _get_pending_count(
         self, token_id: int, for_image_generation: bool, for_video_generation: bool
@@ -86,7 +267,9 @@ class LoadBalancer:
             remaining 为 None 表示无限制
         """
         if not self.concurrency_manager:
-            return 0, None
+            return await self._get_pending_count(
+                token_id, for_image_generation, for_video_generation
+            ), None
 
         if for_image_generation:
             inflight = await self.concurrency_manager.get_image_inflight(token_id)
@@ -122,6 +305,47 @@ class LoadBalancer:
             return await self.concurrency_manager.acquire_video(token_id)
 
         return True
+
+    async def _claim_pending_candidate(
+        self, candidates: list[dict], for_image_generation: bool,
+        for_video_generation: bool, enforce_concurrency_filter: bool,
+    ) -> Optional[dict]:
+        """Distribute a burst before slow account validation starts.
+
+        Refreshing load and recording a queue reservation share one short lock;
+        network health checks run after it is released.
+        """
+        async with self._pending_selection_lock:
+            available = []
+            for item in candidates:
+                inflight, remaining = await self._get_token_load(
+                    item["token"].id, for_image_generation, for_video_generation
+                )
+                if enforce_concurrency_filter and remaining == 0:
+                    continue
+                available.append({**item, "inflight": inflight, "remaining": remaining})
+            if not available:
+                return None
+            if config.call_logic_mode == "polling":
+                scenario = "image" if for_image_generation else (
+                    "video" if for_video_generation else "default"
+                )
+                lowest_load = min(item["inflight"] for item in available)
+                least_loaded = [item for item in available if item["inflight"] == lowest_load]
+                ready = [item for item in least_loaded if not item["needs_refresh"]]
+                selected = await self._select_round_robin(ready or least_loaded, scenario)
+            else:
+                selected = min(available, key=lambda item: (
+                    item["inflight"],
+                    1 if item["needs_refresh"] else 0,
+                    0 if item["remaining"] is None else 1,
+                    -(item["remaining"] or 0),
+                    item["random"],
+                ))
+            await self._add_pending(
+                selected["token"].id, for_image_generation, for_video_generation
+            )
+            return selected
 
     async def _select_round_robin(
         self, tokens: list[dict], scenario: str
@@ -173,6 +397,7 @@ class LoadBalancer:
         reserve: bool = False,
         enforce_concurrency_filter: bool = True,
         track_pending: bool = False,
+        exclude_token_ids=None,
     ) -> Optional[Token]:
         """
         Select a token using load-aware balancing
@@ -189,10 +414,17 @@ class LoadBalancer:
             track_pending:
                 Whether to count the selected token as a queued request immediately.
                 This smooths burst distribution before the hard concurrency slot is acquired.
+            exclude_token_ids:
+                Accounts this request has already failed on and must not run on again.
 
         Returns:
             Selected token or None if no available tokens
         """
+        selection_key = (for_image_generation, for_video_generation, model)
+        # Store only this task's result. A new selection, including one with no
+        # candidates, supersedes it; child tasks cannot consume an inherited one.
+        selection_owner = asyncio.current_task()
+        self._selection_health.set((selection_owner, selection_key, None))
         debug_logger.log_info(
             f"[LOAD_BALANCER] 开始选择Token (图片生成={for_image_generation}, "
             f"视频生成={for_video_generation}, 模型={model}, 预占槽位={reserve})"
@@ -210,14 +442,25 @@ class LoadBalancer:
         available_tokens = []
         filtered_reasons = {}
         required_tier = get_required_paygate_tier_for_model(model)
+        health_candidate_count = 0
+        health_failures = []
+        cooldown_failures = []
+        excluded = set(exclude_token_ids or ())
 
         for token in active_tokens:
+            if token.id in excluded:
+                filtered_reasons[token.id] = "本次请求已在该账号失败，改用其他账号"
+                continue
             normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
             if model and not supports_model_for_tier(model, normalized_tier):
                 filtered_reasons[token.id] = (
                     "账号等级不足，需要 " + get_paygate_tier_label(required_tier)
                 )
                 continue
+            if (not for_image_generation or token.image_enabled) and (
+                not for_video_generation or token.video_enabled
+            ):
+                health_candidate_count += 1
             if for_image_generation:
                 if not token.image_enabled:
                     filtered_reasons[token.id] = "图片生成已禁用"
@@ -254,6 +497,15 @@ class LoadBalancer:
                     filtered_reasons[token.id] = "视频并发已满"
                     continue
 
+            cooldown_reason = self.get_generation_cooldown_reason(
+                token, for_image_generation=for_image_generation,
+                for_video_generation=for_video_generation, model=model,
+            )
+            if cooldown_reason:
+                filtered_reasons[token.id] = cooldown_reason
+                cooldown_failures.append(cooldown_reason)
+                continue
+
             inflight, remaining = await self._get_token_load(
                 token.id,
                 for_image_generation=for_image_generation,
@@ -266,8 +518,18 @@ class LoadBalancer:
                 "remaining": remaining,
                 "needs_refresh": self.token_manager.needs_at_refresh(token),
                     "random": random.random(),
+                    "low_credit": for_video_generation and self._below_video_credit_floor(token),
                 }
             )
+
+        # Prefer accounts that can pay for the video. When none can, keep them
+        # all: a stale or unreadable balance must not become a pool-wide outage.
+        funded = [item for item in available_tokens if not item["low_credit"]]
+        if funded and len(funded) != len(available_tokens):
+            for item in available_tokens:
+                if item["low_credit"]:
+                    filtered_reasons[item["token"].id] = f"账号积分不足（剩余 {item['token'].credits}）"
+            available_tokens = funded
 
         if filtered_reasons:
             debug_logger.log_info(f"[LOAD_BALANCER] 已过滤Token:")
@@ -275,6 +537,11 @@ class LoadBalancer:
                 debug_logger.log_info(f"[LOAD_BALANCER]   - Token {token_id}: {reason}")
 
         if not available_tokens:
+            if health_candidate_count and len(cooldown_failures) == health_candidate_count:
+                self._selection_health.set((
+                    selection_owner, selection_key,
+                    self._selection_unavailable_message(health_failures, cooldown_failures),
+                ))
             debug_logger.log_info(
                 f"[LOAD_BALANCER] ❌ 没有可用的Token (图片生成={for_image_generation}, 视频生成={for_video_generation})"
             )
@@ -282,7 +549,7 @@ class LoadBalancer:
 
         # 最低 in-flight 优先；有并发上限时，剩余槽位更多的 token 优先；最后随机打散
         call_mode = config.call_logic_mode
-        if call_mode == "polling":
+        if call_mode == "polling" and not track_pending:
             scenario = "default"
             if for_image_generation:
                 scenario = "image"
@@ -332,36 +599,94 @@ class LoadBalancer:
             )
 
         # 只为候选列表中真正尝试到的 token 做 AT 校验，避免每次请求把所有 token 全扫一遍
-        for item in available_tokens:
+        get_health_error = getattr(self.token_manager, "get_last_validation_error", None)
+        exit_rotation = getattr(self, "exit_rotation", None)
+        while available_tokens:
+            if track_pending:
+                item = await self._claim_pending_candidate(
+                    available_tokens, for_image_generation,
+                    for_video_generation, enforce_concurrency_filter,
+                )
+                if item is None:
+                    break
+                available_tokens = [
+                    candidate for candidate in available_tokens
+                    if candidate["token"].id != item["token"].id
+                ]
+            else:
+                item = available_tokens.pop(0)
             token = item["token"]
             token_id = token.id
-
-            token = await self.token_manager.ensure_valid_token(token)
-            if not token:
-                debug_logger.log_info(
-                    f"[LOAD_BALANCER] 跳过 Token {token_id}: AT无效或已过期"
+            selected = False
+            try:
+                if exit_rotation is not None:
+                    try:
+                        token = await exit_rotation.prepare_token(token)
+                    except Exception as exc:
+                        health_failures.append("EXIT_ROTATION: no verified exit available")
+                        debug_logger.log_warning(
+                            f"[EXIT_ROTATION] Token {token_id}: preparation failed ({type(exc).__name__})"
+                        )
+                        continue
+                # A concurrent request can open a circuit after the candidate
+                # list was built or while this account's exit was prepared.
+                cooldown_reason = self.get_generation_cooldown_reason(
+                    token, for_image_generation=for_image_generation,
+                    for_video_generation=for_video_generation, model=model,
                 )
-                continue
+                if cooldown_reason:
+                    cooldown_failures.append(cooldown_reason)
+                    continue
+                token = await self.token_manager.ensure_valid_token(token)
+                if not token:
+                    if exit_rotation is not None:
+                        try:
+                            await exit_rotation.mark_health_error(token_id)
+                        except Exception as exc:
+                            debug_logger.log_warning(
+                                f"[EXIT_ROTATION] Token {token_id}: health state write failed ({type(exc).__name__})"
+                            )
+                    reason = get_health_error(token_id) if callable(get_health_error) else None
+                    if isinstance(reason, str) and reason.strip():
+                        health_failures.append(reason)
+                    debug_logger.log_info(
+                        f"[LOAD_BALANCER] 跳过 Token {token_id}: AT无效或已过期"
+                    )
+                    continue
 
-            if reserve and not await self._reserve_slot(
-                token.id, for_image_generation, for_video_generation
-            ):
-                debug_logger.log_info(
-                    f"[LOAD_BALANCER] 跳过 Token {token.id}: 预占槽位失败"
+                cooldown_reason = self.get_generation_cooldown_reason(
+                    token, for_image_generation=for_image_generation,
+                    for_video_generation=for_video_generation, model=model,
                 )
-                continue
+                if cooldown_reason:
+                    cooldown_failures.append(cooldown_reason)
+                    continue
 
-            if track_pending:
-                await self._add_pending(
+                if reserve and not await self._reserve_slot(
                     token.id, for_image_generation, for_video_generation
+                ):
+                    debug_logger.log_info(
+                        f"[LOAD_BALANCER] 跳过 Token {token.id}: 预占槽位失败"
+                    )
+                    continue
+
+                debug_logger.log_info(
+                    f"[LOAD_BALANCER] ✅ 已选择Token {token.id} ({token.email}) - "
+                    f"余额: {token.credits}, inflight={item['inflight']}"
                 )
+                selected = True
+                return token
+            finally:
+                if track_pending and not selected:
+                    await self.release_pending(
+                        token_id, for_image_generation, for_video_generation
+                    )
 
-            debug_logger.log_info(
-                f"[LOAD_BALANCER] ✅ 已选择Token {token.id} ({token.email}) - "
-                f"余额: {token.credits}, inflight={item['inflight']}"
-            )
-            return token
-
+        if health_candidate_count and len(health_failures) + len(cooldown_failures) == health_candidate_count:
+            self._selection_health.set((
+                selection_owner, selection_key,
+                self._selection_unavailable_message(health_failures, cooldown_failures),
+            ))
         debug_logger.log_info(
             f"[LOAD_BALANCER] ❌ 候选Token均不可用 (图片生成={for_image_generation}, 视频生成={for_video_generation})"
         )
@@ -374,7 +699,15 @@ class LoadBalancer:
         for_video_generation: bool = False,
         model: Optional[str] = None,
     ) -> Optional[str]:
-        """给出更明确的“无可用账号”原因，优先用于分辨率/tier 档位提示。"""
+        """Explain tier/capability filtering or a failure shared by all candidates."""
+        selection = self._selection_health.get()
+        self._selection_health.set(None)
+        selection_known = bool(
+            selection and selection[0] is asyncio.current_task()
+            and selection[1] == (for_image_generation, for_video_generation, model)
+        )
+        if selection_known and selection[2]:
+            return selection[2]
         active_tokens = await self.token_manager.get_active_tokens()
         if not active_tokens:
             return None
@@ -405,4 +738,6 @@ class LoadBalancer:
             if for_video_generation:
                 return "当前有符合档位的账号，但视频生成功能已全部禁用。"
 
+        # Historical manager errors cannot describe this request's quota or
+        # capabilities. Health reasons come only from its selection above.
         return None

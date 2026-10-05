@@ -6,6 +6,7 @@ the retired Labs tRPC and AI Sandbox REST endpoints.
 """
 
 import base64
+import math
 import re
 import time
 import uuid
@@ -15,6 +16,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 from ..core.config import config
 from ..core.logger import debug_logger
 from .browser_cookie_utils import validate_flow_cookie_storage
+from .captcha_errors import BrowserCaptchaError
 
 class CurrentFlowClientMixin:
     FRONTEND_ACCESS_TOKEN = "flow-frontend-cookie"
@@ -184,14 +186,18 @@ class CurrentFlowClientMixin:
             token_id=token_id,
         )
         values = payload if isinstance(payload, list) else []
-        credits = next(
+        balance = next(
             (
-                int(value)
+                value
                 for value in values
                 if isinstance(value, (int, float)) and not isinstance(value, bool)
+                and (isinstance(value, int) or math.isfinite(value))
             ),
-            0,
+            None,
         )
+        if balance is None or balance < 0:
+            raise RuntimeError("Flow credits RPC response invalid")
+        credits = int(balance)
         return {
             "credits": credits,
             "userPaygateTier": (
@@ -342,6 +348,24 @@ class CurrentFlowClientMixin:
         finally:
             await self._notify_browser_captcha_request_finished(browser_id)
 
+    async def _submit_browser_native_image(self, **kwargs) -> Dict[str, Any]:
+        from .browser_captcha import BrowserCaptchaService
+
+        service = await BrowserCaptchaService.get_instance(self.db)
+        callback = self.get_generation_sent_callback()
+        if callback is not None:
+            kwargs["on_generation_sent"] = callback
+        return await service.generate_image(**kwargs)
+
+    async def _submit_browser_native_video(self, **kwargs) -> Dict[str, Any]:
+        from .browser_captcha import BrowserCaptchaService
+
+        service = await BrowserCaptchaService.get_instance(self.db)
+        callback = self.get_generation_sent_callback()
+        if callback is not None:
+            kwargs["on_generation_sent"] = callback
+        return await service.generate_video(**kwargs)
+
     async def generate_image(
         self,
         at: str,
@@ -365,6 +389,39 @@ class CurrentFlowClientMixin:
         )
         if not str(cookie_storage or "").strip():
             raise RuntimeError("Flow frontend generation requires Google session cookies")
+        if config.captcha_method == "browser":
+            # Preserve the page's original cookies, XSRF token and network stack.
+            # A successful captcha harvest alone does not validate an HTTP replay.
+            started_at = time.time()
+            if progress_callback:
+                await progress_callback("generating_image", 48)
+            native = await self._submit_browser_native_image(
+                project_id=project_id,
+                token_id=token_id,
+                prompt=prompt,
+                model_name=model_name,
+                aspect_ratio=aspect_ratio,
+                image_inputs=image_inputs,
+                timeout=max(5, int(self._get_runtime_config().image_timeout)),
+            )
+            if isinstance(native.get("fingerprint"), dict):
+                self._set_request_fingerprint(native["fingerprint"])
+            if native.get("rpc") != "ogiZ0b":
+                raise RuntimeError("Browser returned an unsupported image transport")
+            frames = self._parse_batchexecute_frames(native.get("response_text", ""))
+            self._raise_batchexecute_error(frames, "ogiZ0b")
+            payload = self._extract_batchexecute_payload(frames, "ogiZ0b")
+            if payload is None:
+                raise RuntimeError("Native browser image request returned no payload")
+            result = self._normalize_frontend_image_generation_response(payload)
+            session_id = str(native.get("session_id") or "")
+            trace = {"max_retries": 1, "final_success_attempt": 1, "generation_attempts": [{
+                "attempt": 1, "success": True, "transport": "browser-native-ogiZ0b",
+                "duration_ms": int((time.time() - started_at) * 1000),
+            }]}
+            if progress_callback:
+                await progress_callback("processing_image", 72)
+            return result, session_id, trace
         for retry_attempt in range(max_retries):
             started_at = time.time()
             browser_id = None
@@ -372,81 +429,18 @@ class CurrentFlowClientMixin:
             try:
                 if progress_callback:
                     await progress_callback("solving_image_captcha", 38)
-                # 通道与 action 必须按打码方式配套：
-                # - browser (harvest)：页面原生 token + 原生会话 id，走 StreamChat；
-                #   页面实际执行的 reCAPTCHA action 为 CHAT_GENERATION。
-                # - 第三方打码 (yescaptcha 等)：token 只被 batchexecute 通道接受，
-                #   走原 ogiZ0b 链路，action 保持上游既有的 IMAGE_GENERATION。
-                stream_transport = config.captcha_method == "browser"
                 token, browser_id = await self._get_recaptcha_token(
                     project_id,
-                    action=(
-                        "CHAT_GENERATION" if stream_transport else "IMAGE_GENERATION"
-                    ),
+                    action="IMAGE_GENERATION",
                     token_id=token_id,
                     website_url=self._build_flow_frontend_project_page_url(project_id),
                 )
                 attempt["recaptcha_ok"] = bool(token)
                 if not token:
                     raise RuntimeError("Failed to obtain reCAPTCHA token")
+                attempt["transport"] = "ogiZ0b"
                 if progress_callback:
                     await progress_callback("submitting_image", 48)
-                harvest_session_id = (
-                    self._extract_browser_captcha_session_id(browser_id)
-                    if stream_transport
-                    else None
-                )
-                if stream_transport and not harvest_session_id:
-                    raise RuntimeError(
-                        "Browser harvest returned no Flow session id"
-                    )
-                if harvest_session_id:
-                    stream_result = await self._call_flow_stream_chat(
-                        project_id=project_id,
-                        prompt=prompt,
-                        recaptcha_token=token,
-                        session_id=harvest_session_id,
-                        cookie_header="",
-                        timeout=max(
-                            self._get_runtime_config().flow_image_request_timeout, 90
-                        ),
-                        cookie_storage=cookie_storage,
-                    )
-                    media_ids = list(stream_result.get("mediaIds") or [])
-                    if not media_ids:
-                        raise RuntimeError(
-                            "Flow StreamChat returned no generated media "
-                            f"(rawLength={stream_result.get('rawLength')})"
-                        )
-                    if progress_callback:
-                        await progress_callback("processing_image", 72)
-                    # 媒体 id 需通过 as29s 换取带签名的 flow-content 下载地址
-                    media = []
-                    for media_id in media_ids[:2]:
-                        media_entry = await self.get_media(
-                            at,
-                            media_id,
-                            google_cookies=google_cookies,
-                            token_id=token_id,
-                            project_id=project_id,
-                        )
-                        if str(
-                            (media_entry.get("image") or {})
-                            .get("generatedImage", {})
-                            .get("fifeUrl")
-                            or ""
-                        ):
-                            media.append(media_entry)
-                    if not media:
-                        raise RuntimeError(
-                            "Flow StreamChat media could not be resolved to a download URL"
-                        )
-                    result = {"media": media, "frontendRpc": "StreamChat"}
-                    attempt["success"] = True
-                    attempt["duration_ms"] = int((time.time() - started_at) * 1000)
-                    trace["generation_attempts"].append(attempt)
-                    trace["final_success_attempt"] = retry_attempt + 1
-                    return result, harvest_session_id, trace
                 session_id = str(uuid.uuid4()).upper()
                 payload = await self._current_rpc(
                     rpc_id="ogiZ0b",
@@ -478,6 +472,8 @@ class CurrentFlowClientMixin:
                 attempt["error"] = str(error)[:240]
                 attempt["duration_ms"] = int((time.time() - started_at) * 1000)
                 trace["generation_attempts"].append(attempt)
+                if self._generation_request_was_sent():
+                    raise
                 if retry_attempt >= max_retries - 1:
                     raise
             finally:
@@ -485,11 +481,7 @@ class CurrentFlowClientMixin:
         raise last_error or RuntimeError("Flow frontend image generation failed")
 
     def _resolve_batchexecute_captcha_override(self) -> Optional[str]:
-        """batchexecute 类 RPC（SPrCad 放大、YhhmEf 视频等）只接受第三方打码 token。
-
-        browser/personal harvest 的 token 会被 UNUSUAL_ACTIVITY 拒绝（实测矩阵）。
-        browser 类模式下必须配置第三方打码密钥，否则直接返回明确配置错误。
-        """
+        """Select a solver for HTTP submissions that have no native browser path."""
         if config.captcha_method not in ("browser", "personal", "remote_browser", "extension"):
             return None
         method = self._resolve_third_party_captcha_method()
@@ -563,8 +555,38 @@ class CurrentFlowClientMixin:
         end_media_id: Optional[str] = None,
         video_media_id: Optional[str] = None,
         resolution: Optional[str] = None,
+        frame_images: Optional[List[bytes]] = None,
     ) -> dict:
         await self._frontend_cookie(google_cookies, token_id)
+        if (
+            config.captcha_method == "browser"
+            and ((mode == "text" and re.fullmatch(r"abra_t2v_(?:4|6|8|10)s", model_key))
+                 or (mode in {"start", "start_end"} and frame_images
+                     and re.fullmatch(r"abra_i2v_(?:4|6|8|10)s", model_key)))
+        ):
+            native = await self._submit_browser_native_video(
+                project_id=project_id, token_id=token_id, prompt=prompt,
+                model_key=model_key, aspect_ratio=aspect_ratio,
+                timeout=max(self._get_video_submit_timeout(), 300 if frame_images else 120),
+                **({"mode": mode, "frame_images": frame_images} if frame_images else {}),
+                **({"resolution": resolution} if resolution else {}),
+            )
+            if isinstance(native.get("fingerprint"), dict):
+                self._set_request_fingerprint(native["fingerprint"])
+            rpc_id = {"text": "YhhmEf", "start": "eb1hJf", "start_end": "nprQif"}[mode]
+            if native.get("rpc") != rpc_id:
+                raise RuntimeError("Browser returned an unsupported video transport")
+            frames = self._parse_batchexecute_frames(native.get("response_text", ""))
+            self._raise_batchexecute_error(frames, rpc_id)
+            payload = self._extract_batchexecute_payload(frames, rpc_id)
+            if payload is None:
+                raise RuntimeError("Native browser video request returned no payload")
+            return self._normalize_frontend_video_submission(
+                payload, project_id=project_id, aspect_ratio=aspect_ratio,
+                model_key=model_key, rpc_id=rpc_id,
+            )
+        if frame_images:
+            raise BrowserCaptchaError("native_frame_prepare", "native_mode_required")
         captcha_override = self._resolve_batchexecute_captcha_override()
         max_retries = max(1, int(self._get_runtime_config().flow_max_retries or 1))
         last_error: Optional[Exception] = None
@@ -613,6 +635,8 @@ class CurrentFlowClientMixin:
                 )
             except Exception as error:
                 last_error = error
+                if self._generation_request_was_sent():
+                    raise
                 # MODEL_ACCESS_DENIED 为账号权限拒绝，重试不会改变结果
                 if "MODEL_ACCESS_DENIED" in str(error):
                     raise
@@ -634,6 +658,7 @@ class CurrentFlowClientMixin:
         token_id: Optional[int] = None,
         token_video_concurrency: Optional[int] = None,
         google_cookies: Optional[str] = None,
+        resolution: Optional[str] = None,
     ) -> dict:
         return await self._current_generate_video(
             project_id=project_id,
@@ -641,9 +666,25 @@ class CurrentFlowClientMixin:
             model_key=model_key,
             aspect_ratio=aspect_ratio,
             mode="text",
+            resolution=resolution,
             token_id=token_id,
             token_video_concurrency=token_video_concurrency,
             google_cookies=google_cookies,
+        )
+
+    async def generate_video_frames(
+        self, *, project_id: str, prompt: str, model_key: str, aspect_ratio: str,
+        frame_images: List[bytes], token_id: Optional[int] = None,
+        token_video_concurrency: Optional[int] = None,
+        google_cookies: Optional[str] = None, resolution: Optional[str] = None,
+    ) -> dict:
+        if not isinstance(frame_images, list) or len(frame_images) not in {1, 2}:
+            raise BrowserCaptchaError("native_frame_prepare", "frame_count_invalid")
+        return await self._current_generate_video(
+            project_id=project_id, prompt=prompt, model_key=model_key, aspect_ratio=aspect_ratio,
+            mode="start_end" if len(frame_images) == 2 else "start", frame_images=frame_images,
+            token_id=token_id, token_video_concurrency=token_video_concurrency,
+            google_cookies=google_cookies, resolution=resolution,
         )
 
     async def generate_video_reference_images(

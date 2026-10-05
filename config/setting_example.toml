@@ -21,6 +21,8 @@ video_slot_wait_timeout = 480
 video_launch_soft_limit = 20
 video_launch_wait_timeout = 480
 video_launch_stagger_ms = 0
+min_video_credits = 10  # 积分低于此值的账号在有其它账号可用时不参与视频生成（0 表示不检查）
+account_retries = 1  # 视频在某个账号上确认未提交上游时，换其它账号重试的次数（0 表示不重试）
 poll_interval = 3.0
 max_poll_attempts = 200
 

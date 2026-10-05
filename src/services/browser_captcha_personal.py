@@ -9310,7 +9310,12 @@ class BrowserCaptchaService:
         normalized_path = script_path.lstrip("/")
         # 默认优先 recaptcha.net；google.com 仅作为回退。
         hosts = ["https://www.recaptcha.net", "https://www.google.com"]
-        suffix = f"?render={website_key}" if website_key else ""
+        # The loader also injects gstatic scripts; request its Trusted Types variant.
+        suffix = (
+            f"?render={website_key}&trustedtypes=true"
+            if website_key
+            else "?trustedtypes=true"
+        )
         return [f"{host}/{normalized_path}{suffix}" for host in hosts]
 
     async def _resolve_personal_proxy_download_url(self) -> Optional[str]:
@@ -9885,6 +9890,35 @@ class BrowserCaptchaService:
                 const forceRemote = {json.dumps(force_remote)};
                 const stateKey = '__flow2apiRecaptchaBootstrapState';
                 const scriptTimeoutMs = 8000;
+                const urls = {json.dumps(candidate_urls)};
+                const nonceSource = document.querySelector('script[nonce]');
+                const scriptNonce = nonceSource
+                    ? (nonceSource.nonce || nonceSource.getAttribute('nonce') || '')
+                    : '';
+                const trustedScriptURL = (url) => {{
+                    if (!window.trustedTypes) return url;
+                    const policyKey = '__flow2apiRecaptchaTrustedPolicies';
+                    const policies = window[policyKey] || (window[policyKey] = new Map());
+                    const signature = JSON.stringify(urls);
+                    let policy = policies.get(signature);
+                    if (!policy) {{
+                        const allowedUrls = new Set(urls);
+                        policy = window.trustedTypes.createPolicy(
+                            `flow2api-recaptcha-bootstrap-${{policies.size}}`,
+                            {{
+                                createScriptURL: (value) => {{
+                                    const candidate = String(value);
+                                    if (!allowedUrls.has(candidate)) {{
+                                        throw new TypeError('reCAPTCHA script URL is not allowed');
+                                    }}
+                                    return candidate;
+                                }},
+                            }},
+                        );
+                        policies.set(signature, policy);
+                    }}
+                    return policy.createScriptURL(url);
+                }};
                 const now = () => Date.now();
                 const ensureState = () => {{
                     if (!window[stateKey] || typeof window[stateKey] !== 'object') {{
@@ -9933,7 +9967,6 @@ class BrowserCaptchaService:
                         .querySelectorAll('script[src*="recaptcha"]')
                         .forEach((node) => node.remove());
                 }}
-                const urls = {json.dumps(candidate_urls)};
                 const parent = document.head || document.documentElement || document.body;
                 if (!parent) {{
                     state.status = 'error';
@@ -9957,9 +9990,9 @@ class BrowserCaptchaService:
                     state.finishedAt = 0;
                     state.attempts = Number(state.attempts || 0) + 1;
                     const script = document.createElement('script');
-                    script.src = urls[index];
                     script.async = true;
                     let settled = false;
+                    let timer = null;
                     const finish = (status, error) => {{
                         if (settled) return;
                         settled = true;
@@ -9967,22 +10000,33 @@ class BrowserCaptchaService:
                         state.error = error ? String(error) : '';
                         state.finishedAt = now();
                     }};
-                    const timer = setTimeout(() => {{
-                        script.remove();
-                        finish('timeout', `script load timeout: ${{urls[index]}}`);
-                        loadScript(index + 1);
-                    }}, scriptTimeoutMs);
                     script.onload = () => {{
                         clearTimeout(timer);
                         finish('loaded', '');
                     }};
                     script.onerror = () => {{
+                        if (settled) return;
                         clearTimeout(timer);
                         script.remove();
                         finish('error', `script load error: ${{urls[index]}}`);
                         loadScript(index + 1);
                     }};
-                    parent.appendChild(script);
+                    try {{
+                        if (scriptNonce) script.nonce = scriptNonce;
+                        script.src = trustedScriptURL(urls[index]);
+                        timer = setTimeout(() => {{
+                            if (settled) return;
+                            script.remove();
+                            finish('timeout', `script load timeout: ${{urls[index]}}`);
+                            loadScript(index + 1);
+                        }}, scriptTimeoutMs);
+                        parent.appendChild(script);
+                    }} catch (error) {{
+                        clearTimeout(timer);
+                        script.remove();
+                        finish('error', error && error.message ? error.message : String(error));
+                        loadScript(index + 1);
+                    }}
                 }};
                 loadScript(0);
             }})()

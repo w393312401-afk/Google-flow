@@ -20,9 +20,10 @@ class _FakeProxyManager:
 class _FakeAsyncSession:
     """模拟 curl_cffi 的 AsyncSession: createTask 返回 taskId, getTaskResult 返回 ready。"""
 
-    def __init__(self):
+    def __init__(self, solution_extra=None):
         self._calls = 0
         self.requests = []
+        self.solution_extra = solution_extra or {}
 
     async def __aenter__(self):
         return self
@@ -56,6 +57,7 @@ class _FakeAsyncSession:
                     ),
                 },
             }
+            response.json.return_value["solution"].update(self.solution_extra)
         return response
 
 
@@ -88,6 +90,35 @@ class _FakeCaptchaRunSession:
 
 
 class ApiCaptchaFingerprintTests(unittest.IsolatedAsyncioTestCase):
+    async def test_solver_session_and_exact_client_hints_are_preserved(self):
+        flow = FlowClient.__new__(FlowClient)
+        flow.proxy_manager = _FakeProxyManager()
+        exact_hint = '"Chromium";v="147", "Not_A Brand";v="99"'
+        fake_session = _FakeAsyncSession({
+            "secChUa": exact_hint,
+            "recaptcha-ca-t": "new-session",
+            "recaptcha-ca-e": "new-extra",
+            "SID": "untrusted-auth",
+        })
+        flow._set_request_fingerprint({"session_cookies": {"other": "existing"}})
+        with patch("src.services.flow_client.AsyncSession", lambda *a, **kw: fake_session), patch("src.services.flow_client.config") as cfg:
+            cfg.capsolver_api_key = "key"
+            cfg.capsolver_base_url = "https://api.capsolver.com"
+            cfg.captcha_method = "capsolver"
+            cfg.capsolver_is_session = True
+            cfg.debug_enabled = False
+            result = await flow._get_recaptcha_token("proj-1", token_id=1)
+        self.assertEqual(result, ("token-abc", None))
+        self.assertIs(fake_session.requests[0][1]["json"]["task"]["isSession"], True)
+        fingerprint = flow.get_request_fingerprint()
+        self.assertEqual(fingerprint["sec_ch_ua"], exact_hint)
+        self.assertEqual(flow._normalize_sec_ch_ua_header(exact_hint, user_agent=fingerprint["user_agent"], preserve_supplied=True), exact_hint)
+        self.assertEqual(fingerprint["session_cookies"], {"other": "existing", "recaptcha-ca-t": "new-session", "recaptcha-ca-e": "new-extra"})
+        merged = flow._merge_cookie_header("SID=auth; recaptcha-ca-t=old-session", {**fingerprint["session_cookies"], "SID": "untrusted-auth"})
+        self.assertIn("SID=auth", merged)
+        self.assertIn("recaptcha-ca-t=new-session", merged)
+        self.assertNotIn("untrusted-auth", merged)
+
     async def test_api_captcha_returns_token_and_user_agent(self):
         """_get_api_captcha_token 必须返回 (token, userAgent) 元组。"""
         flow = FlowClient.__new__(FlowClient)

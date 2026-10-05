@@ -235,6 +235,24 @@ class Config:
             return 0
 
     @property
+    def flow_account_retries(self) -> int:
+        """视频在某个账号上确认未提交上游时，换其它账号重试的次数(0 表示不重试)。"""
+        value = self._config.get("flow", {}).get("account_retries", 1)
+        try:
+            return max(0, min(5, int(value)))
+        except Exception:
+            return 1
+
+    @property
+    def flow_min_video_credits(self) -> int:
+        """视频生成所需的最低账号积分；低于此值的账号在有其它账号可用时不参与选择(0 表示不检查)。"""
+        value = self._config.get("flow", {}).get("min_video_credits", 10)
+        try:
+            return max(0, min(100000, int(value)))
+        except Exception:
+            return 10
+
+    @property
     def poll_interval(self) -> float:
         return self._config["flow"]["poll_interval"]
 
@@ -654,6 +672,11 @@ class Config:
         return self._config.get("captcha", {}).get(
             "capsolver_base_url", "https://api.capsolver.com"
         )
+
+    @property
+    def capsolver_is_session(self) -> bool:
+        """Request provider session cookies; opt in through [captcha] settings."""
+        return self._config.get("captcha", {}).get("capsolver_is_session", False) is True
 
     def set_capsolver_base_url(self, base_url: str):
         """Set CapSolver base URL"""

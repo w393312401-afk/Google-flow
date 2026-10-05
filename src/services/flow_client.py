@@ -11,7 +11,7 @@ import gzip
 import ssl
 import re
 from typing import Dict, Any, Optional, List, Union, Callable, Awaitable
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import parse_qs, quote, urljoin, urlparse
 import urllib.error
 import urllib.request
 from curl_cffi.requests import AsyncSession
@@ -19,6 +19,7 @@ from ..core.logger import debug_logger
 from ..core.config import config, get_yescaptcha_min_score
 from .flow_current import CurrentFlowClientMixin
 from .flow_frontend import FlowFrontendMixin
+from .captcha_errors import BrowserCaptchaError
 
 try:
     import httpx
@@ -128,6 +129,74 @@ class _FlowClientBase(FlowFrontendMixin):
         """清理请求链路绑定的浏览器指纹。"""
         self._set_request_fingerprint(None)
 
+    def set_generation_sent_callback(self, callback: Callable[[], Awaitable[None]]):
+        """Bind an outgoing-generation observer to this request's async context."""
+        if not hasattr(self, "_generation_sent_ctx"):
+            self._generation_sent_ctx = contextvars.ContextVar(
+                "flow_generation_sent", default=None,
+            )
+        return self._generation_sent_ctx.set({"callback": callback, "sent": False})
+
+    def clear_generation_sent_callback(self, token=None):
+        context = getattr(self, "_generation_sent_ctx", None)
+        if context is not None:
+            if token is None:
+                context.set(None)
+            else:
+                try:
+                    context.reset(token)
+                except ValueError:
+                    # An async generator may be closed from a consumer's other
+                    # context. Cleanup must not hide the original error there.
+                    context.set(None)
+
+    def _generation_request_was_sent(self) -> bool:
+        context = getattr(self, "_generation_sent_ctx", None)
+        state = context.get() if context is not None else None
+        return bool(state and state["sent"])
+
+    def get_generation_sent_callback(self):
+        """Capture state explicitly: Playwright handlers may use another context."""
+        context = getattr(self, "_generation_sent_ctx", None)
+        state = context.get() if context is not None else None
+        if not state or state["callback"] is None:
+            return None
+
+        async def notify_bound_request():
+            await self._notify_generation_sent(state)
+
+        return notify_bound_request
+
+    async def _notify_generation_sent(self, state=None):
+        if state is None:
+            context = getattr(self, "_generation_sent_ctx", None)
+            state = context.get() if context is not None else None
+        if not state or state["sent"] or state["callback"] is None:
+            return
+        # Claim before awaiting the observer. Observer failures must never cause
+        # an ambiguous generation POST to be replayed by an outer retry loop.
+        state["sent"] = True
+        await state["callback"]()
+
+    @staticmethod
+    def _is_generation_post(method: str, url: str) -> bool:
+        if method.upper() != "POST":
+            return False
+        parsed = urlparse(url)
+        if parsed.hostname != "flow.google.com":
+            return False
+        if "StreamChat" in parsed.path:
+            return True
+        if not parsed.path.endswith("/batchexecute"):
+            return False
+        rpc_ids = {
+            rpc for group in parse_qs(parsed.query).get("rpcids", [])
+            for rpc in group.split(",")
+        }
+        return bool(rpc_ids & {
+            "ogiZ0b", "YhhmEf", "nprQif", "eb1hJf", "MZZa6b", "fZytfe", "p0UkFb",
+        })
+
     def _get_primary_accept_language(self, fallback: str = "zh-CN,zh;q=0.9") -> str:
         fingerprint = self.get_request_fingerprint()
         if isinstance(fingerprint, dict):
@@ -168,11 +237,14 @@ class _FlowClientBase(FlowFrontendMixin):
         sec_ch_ua: Optional[str],
         *,
         user_agent: Optional[str] = None,
+        preserve_supplied: bool = False,
     ) -> str:
         raw = str(sec_ch_ua or "").strip()
         inferred = self._infer_sec_ch_ua_from_user_agent(user_agent)
         if not raw:
             return inferred
+        if preserve_supplied:
+            return raw
         ua_text = str(user_agent or "").lower()
         if "chrome/" in ua_text and "google chrome" not in raw.lower():
             return inferred
@@ -301,7 +373,8 @@ class _FlowClientBase(FlowFrontendMixin):
                 if (
                     normalized_key
                     and normalized_value
-                    and normalized_key not in cookie_items
+                    and (normalized_key not in cookie_items
+                         or normalized_key in {"recaptcha-ca-t", "recaptcha-ca-e"})
                 ):
                     cookie_items[normalized_key] = normalized_value
 
@@ -468,6 +541,7 @@ class _FlowClientBase(FlowFrontendMixin):
                 headers["sec-ch-ua"] = self._normalize_sec_ch_ua_header(
                     fingerprint["sec_ch_ua"],
                     user_agent=headers.get("User-Agent"),
+                    preserve_supplied=fingerprint.get("sec_ch_ua_source") == "captcha",
                 )
             if fingerprint.get("sec_ch_ua_mobile"):
                 headers["sec-ch-ua-mobile"] = fingerprint["sec_ch_ua_mobile"]
@@ -721,6 +795,7 @@ class _FlowClientBase(FlowFrontendMixin):
                 headers["sec-ch-ua"] = self._normalize_sec_ch_ua_header(
                     fingerprint["sec_ch_ua"],
                     user_agent=headers.get("User-Agent"),
+                    preserve_supplied=fingerprint.get("sec_ch_ua_source") == "captcha",
                 )
             if fingerprint.get("sec_ch_ua_mobile"):
                 headers["sec-ch-ua-mobile"] = fingerprint["sec_ch_ua_mobile"]
@@ -824,6 +899,10 @@ class _FlowClientBase(FlowFrontendMixin):
                         request_kwargs["data"] = raw_body
                     else:
                         request_kwargs["json"] = json_data
+                    if self._is_generation_post(method, url):
+                        if self._generation_request_was_sent():
+                            raise RuntimeError("Generation POST already sent; replay disabled")
+                        await self._notify_generation_sent()
                     response = await session.post(url, **request_kwargs)
 
                 duration_ms = (time.time() - start_time) * 1000
@@ -5216,6 +5295,9 @@ class _FlowClientBase(FlowFrontendMixin):
                     )
                 self._set_request_fingerprint(fingerprint if token else None)
                 return token, browser_id
+            except BrowserCaptchaError:
+                self._set_request_fingerprint(None)
+                raise
             except RuntimeError as e:
                 # 捕获 Docker 环境或依赖缺失的明确错误
                 error_msg = str(e)
@@ -5358,7 +5440,7 @@ class _FlowClientBase(FlowFrontendMixin):
             method: 打码服务类型
             project_id: 项目ID
             action: reCAPTCHA action类型 (IMAGE_GENERATION 或 VIDEO_GENERATION)
-            proxy_url: 预解析后的代理地址，确保打码与后续提交走同一出口
+            proxy_url: 调用打码服务 API 的代理；ProxyLess 任务的解题出口由服务商决定
             user_agent: 显式传给打码服务的 UA，避免 solve / submit 环境不一致
 
         Returns:
@@ -5504,6 +5586,8 @@ class _FlowClientBase(FlowFrontendMixin):
                 }
                 if method == "yescaptcha":
                     create_data["softID"] = "33424"
+                if method == "capsolver" and config.capsolver_is_session is True:
+                    create_data["task"]["isSession"] = True
                 if effective_user_agent:
                     create_data["task"]["userAgent"] = effective_user_agent
                 if min_score is not None:
@@ -5539,7 +5623,7 @@ class _FlowClientBase(FlowFrontendMixin):
                     task_id = result_json.get("taskId")
 
                     debug_logger.log_info(
-                        f"[reCAPTCHA {method}] created task_id: {task_id}, response: {result_json}"
+                        f"[reCAPTCHA {method}] task created={bool(task_id)}"
                     )
 
                     if task_id:
@@ -5594,7 +5678,7 @@ class _FlowClientBase(FlowFrontendMixin):
                     result_json = result.json()
 
                     debug_logger.log_info(
-                        f"[reCAPTCHA {method}] polling #{i + 1}: {result_json}"
+                        f"[reCAPTCHA {method}] polling #{i + 1}: status={result_json.get('status')}"
                     )
 
                     status = result_json.get("status")
@@ -5602,12 +5686,30 @@ class _FlowClientBase(FlowFrontendMixin):
                         solution = result_json.get("solution", {})
                         response = solution.get("gRecaptchaResponse")
                         if response:
-                            self._merge_request_fingerprint(
-                                self._build_fingerprint_from_user_agent(
+                            solution_fingerprint = self._build_fingerprint_from_user_agent(
                                     solution.get("userAgent"),
                                     accept_language=self._get_primary_accept_language(),
                                     proxy_url=resolved_proxy_url,
                                 )
+                            sec_ch_ua = str(solution.get("secChUa") or "").strip()
+                            if sec_ch_ua and not any(c in sec_ch_ua for c in "\r\n"):
+                                solution_fingerprint["sec_ch_ua"] = sec_ch_ua
+                                solution_fingerprint["sec_ch_ua_source"] = "captcha"
+                            session_cookies = dict((self.get_request_fingerprint() or {}).get("session_cookies") or {})
+                            for cookie_name in ("recaptcha-ca-t", "recaptcha-ca-e"):
+                                value = str(solution.get(cookie_name) or "").strip()
+                                if value and not any(c in value for c in ";\r\n"):
+                                    session_cookies[cookie_name] = value
+                            if session_cookies:
+                                solution_fingerprint["session_cookies"] = session_cookies
+                            self._merge_request_fingerprint(solution_fingerprint)
+                            print(
+                                f"[reCAPTCHA {method}] solution received: "
+                                f"ua={bool(solution.get('userAgent'))}, "
+                                f"client_hints={bool(sec_ch_ua)}, "
+                                f"session_t={bool(solution.get('recaptcha-ca-t'))}, "
+                                f"session_e={bool(solution.get('recaptcha-ca-e'))}",
+                                flush=True,
                             )
                             debug_logger.log_info(f"[reCAPTCHA {method}] Token获取成功")
                             # 同时返回 userAgent, 调用方会注入到 fingerprint context,

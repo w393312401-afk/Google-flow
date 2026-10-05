@@ -525,6 +525,7 @@ class Database:
                     ("refresh_interval_minutes", "INTEGER DEFAULT 120"),
                     ("last_st_refresh_at", "TIMESTAMP"),
                     ("last_st_refresh_result", "TEXT DEFAULT ''"),
+                    ("adspower_serial", "INTEGER"),  # AdsPower 环境序号
                     ("ban_reason", "TEXT"),  # 禁用原因
                     ("banned_at", "TIMESTAMP"),  # 禁用时间
                 ]
@@ -761,6 +762,7 @@ class Database:
                     refresh_interval_minutes INTEGER DEFAULT 120,
                     last_st_refresh_at TIMESTAMP,
                     last_st_refresh_result TEXT DEFAULT '',
+                    adspower_serial INTEGER,
                     ban_reason TEXT,
                     banned_at TIMESTAMP
                 )
@@ -1116,8 +1118,8 @@ class Database:
                                    captcha_proxy_url, extension_route_key,
                                    protocol_mode, google_cookies, login_account, login_password,
                                    proxy_url, auto_refresh_enabled, refresh_interval_minutes,
-                                   last_st_refresh_at, last_st_refresh_result)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                   last_st_refresh_at, last_st_refresh_result, adspower_serial)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     token.st,
@@ -1146,6 +1148,7 @@ class Database:
                     token.refresh_interval_minutes,
                     token.last_st_refresh_at,
                     token.last_st_refresh_result,
+                    token.adspower_serial,
                 ),
             )
             await db.commit()

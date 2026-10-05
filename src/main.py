@@ -21,6 +21,7 @@ from .services.token_manager import TokenManager
 from .services.load_balancer import LoadBalancer
 from .services.concurrency_manager import ConcurrencyManager
 from .services.generation_handler import GenerationHandler
+from .services.exit_rotation import ExitRotationManager
 from .api import routes, admin
 
 
@@ -265,6 +266,10 @@ generation_handler = GenerationHandler(
     concurrency_manager,
     proxy_manager,  # 添加 proxy_manager 参数
 )
+exit_rotation = ExitRotationManager(db, token_manager)
+token_manager.exit_rotation = exit_rotation
+load_balancer.exit_rotation = exit_rotation
+generation_handler.exit_rotation = exit_rotation
 
 # Set dependencies
 routes.set_generation_handler(generation_handler)

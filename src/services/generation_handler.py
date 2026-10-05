@@ -3,7 +3,9 @@
 import asyncio
 import base64
 import json
+import re
 import time
+from contextlib import aclosing
 from pathlib import Path
 from typing import Optional, AsyncGenerator, List, Dict, Any
 from ..core.logger import debug_logger
@@ -18,6 +20,9 @@ from ..core.account_tiers import (
     supports_model_for_tier,
 )
 from .file_cache import FileCache
+from .captcha_errors import BrowserCaptchaError
+from .flow_frontend import FlowRPCRejected
+from .submission_ledger import SubmissionLedger
 
 
 # Model configuration
@@ -1240,6 +1245,23 @@ def _apply_current_flow_model_catalog():
                 f"Omni 1.1 Flash · {seconds}s · {orientation}",
             )
 
+    # Explicit native Frames models keep first/last semantics separate from
+    # Omni Ingredients/R2V, and expose the requested resolution without defaults.
+    for seconds in (4, 6, 8, 10):
+        for orientation, ratio in (("landscape", landscape), ("portrait", portrait)):
+            for resolution in ("360p", "720p"):
+                register(
+                    f"omni-1.1-flash-frames-{seconds}s-{orientation}-{resolution}",
+                    {**i2v(f"abra_i2v_{seconds}s", ratio), "native_frames": True,
+                     "resolution": resolution},
+                    f"Omni 1.1 Flash · Frames · {seconds}s · {orientation} · {resolution}",
+                )
+                register(
+                    f"omni-1.1-flash-{seconds}s-{orientation}-{resolution}",
+                    {**t2v(f"abra_t2v_{seconds}s", ratio), "resolution": resolution},
+                    f"Omni 1.1 Flash · Text · {seconds}s · {orientation} · {resolution}",
+                )
+
     # Current image-to-video and reference-video variants.
     for seconds, lite_key, fast_key, quality_key in (
         (
@@ -1539,6 +1561,34 @@ class GenerationHandler:
         except Exception as exc:
             debug_logger.log_error(f"[VIDEO] 更新任务失败状态失败: {exc}")
 
+    async def _video_status_unknown(
+        self, token, operations, generation_result, request_log_state, *, reason="poll_failed",
+    ) -> str:
+        """Persist an unresolved submitted operation before the client sees an error."""
+        message = "视频已提交，但状态查询未完成；生成结果尚未确认，请勿重复提交"
+        operation = operations[0] if operations else {}
+        task_id = (operation.get("operation") or {}).get("name") or operation.get("name")
+        payload = {
+            "message": message, "type": "server_error", "code": "video_status_unknown",
+            "status_code": 502, "submission_pending": True, "upstream_accepted": True,
+            "reason": reason, "task_id": task_id,
+        }
+        self._mark_generation_failed(generation_result, message)
+        if isinstance(generation_result, dict):
+            generation_result["submission_pending"] = True
+        if task_id:
+            await self.db.update_task(
+                task_id, status="status_unknown", error_message=message, completed_at=None,
+            )
+        if isinstance(request_log_state, dict) and request_log_state.get("id"):
+            await self.db.update_request_log(
+                request_log_state["id"], token_id=token.id,
+                response_body=json.dumps({"error": payload}, ensure_ascii=False),
+                status_code=502, status_text="video_status_unknown",
+                progress=request_log_state.get("progress", 45),
+            )
+        return json.dumps({"error": payload}, ensure_ascii=False)
+
     async def check_token_availability(self, is_image: bool, is_video: bool) -> bool:
         """检查Token可用性
 
@@ -1562,8 +1612,12 @@ class GenerationHandler:
         stream: bool = False,
         base_url_override: Optional[str] = None,
         video_media_id: Optional[str] = None,
+        client_submission_id: Optional[str] = None,
     ) -> AsyncGenerator:
         """统一生成入口
+
+        视频在某个账号上确认尚未提交上游（且该账号已因此进入冷却）时，换另一个账号
+        再试一次，调用方只会看到最终结果；没有其它账号可用时，返回第一次的原始错误。
 
         Args:
             model: 模型名称
@@ -1571,22 +1625,87 @@ class GenerationHandler:
             images: 图片列表 (bytes格式)
             stream: 是否流式输出
         """
+        extra_attempts = max(0, int(getattr(config, "flow_account_retries", 1)))
+        excluded = set()
+        fallback = None
+        attempt = 0
+        while True:
+            attempt += 1
+            state = {"allow": attempt <= extra_attempts, "attempt": attempt, "fallback": fallback}
+            async with aclosing(self._generate_once(
+                model, prompt, images, stream, base_url_override, video_media_id,
+                client_submission_id, exclude_token_ids=excluded, retry_state=state,
+            )) as chunks:
+                async for chunk in chunks:
+                    yield chunk
+            if not state.get("retry"):
+                return
+            excluded.add(state["token_id"])
+            fallback = state["tail"]
+            debug_logger.log_info(
+                f"[GENERATION] Token {state['token_id']} 尚未提交上游，换用其他账号重试 "
+                f"({attempt}/{extra_attempts + 1})"
+            )
+            if stream:
+                yield self._create_stream_chunk("该账号暂时无法提交，正在换用其他账号重试...\n")
+
+    async def _generate_once(
+        self,
+        model: str,
+        prompt: str,
+        images: Optional[List[bytes]] = None,
+        stream: bool = False,
+        base_url_override: Optional[str] = None,
+        video_media_id: Optional[str] = None,
+        client_submission_id: Optional[str] = None,
+        *,
+        exclude_token_ids=None,
+        retry_state: Optional[Dict[str, Any]] = None,
+    ) -> AsyncGenerator:
+        """一次生成尝试。
+
+        retry_state 由 handle_generation 提供：确认未提交的失败交还给它（retry/token_id/tail），
+        本次不向调用方输出错误；fallback 是上一次失败的错误输出，没有其它账号时原样返回。
+        """
         start_time = time.time()
+        routing_started_at = time.monotonic()
+        attempt = (retry_state or {}).get("attempt", 1)
         token = None
         generation_type = None
         pending_token_state = {"active": False}
+        concurrency_slot_acquired = False
+        selected_token_id = None
+        exit_rotation = getattr(self, "exit_rotation", None)
+        rotation_lease_acquired = False
+        sent_callback_context = None
+        sent_callback_bound = False
+        rotation_error_marked = False
         request_id = f"gen-{int(start_time * 1000)}-{id(asyncio.current_task())}"
+
+        async def mark_rotation_error():
+            nonlocal rotation_error_marked
+            if exit_rotation is not None and selected_token_id is not None and not rotation_error_marked:
+                rotation_error_marked = True
+                try:
+                    await exit_rotation.note_error(selected_token_id, request_id)
+                except Exception as exc:
+                    # Rotation bookkeeping cannot turn an accepted operation's
+                    # unknown status into an ordinary failed generation.
+                    debug_logger.log_warning(
+                        f"[EXIT_ROTATION] Token {selected_token_id}: error state write failed ({type(exc).__name__})"
+                    )
         perf_trace: Dict[str, Any] = {
             "request_id": request_id,
             "model": model,
             "status": "processing",
         }
         generation_result = self._create_generation_result()
+        generation_result["routing_started_at"] = routing_started_at
         response_state = self._create_response_state()
         response_state["base_url"] = (base_url_override or "").strip().rstrip(
             "/"
         ) or None
-        request_log_state: Dict[str, Any] = {"id": None, "progress": 0}
+        request_log_state: Dict[str, Any] = {"id": None, "progress": 0, "client_submission_id": client_submission_id}
 
         # 防止并发链路复用到上一次请求的指纹上下文
         if hasattr(self.flow_client, "clear_request_fingerprint"):
@@ -1597,7 +1716,7 @@ class GenerationHandler:
             error_msg = f"不支持的模型: {model}"
             debug_logger.log_error(error_msg)
             record_generation_result("unknown", "invalid", time.time() - start_time)
-            yield self._create_error_response(error_msg, status_code=400)
+            yield self._create_error_response(error_msg, status_code=400, code='submission_not_started', submission_pending=False, upstream_accepted=False)
             return
 
         model_config = MODEL_CONFIG[model]
@@ -1616,12 +1735,14 @@ class GenerationHandler:
             "prompt": prompt_for_log,
             "has_images": images is not None and len(images) > 0,
         }
+        if client_submission_id:
+            request_payload['client_submission_id'] = client_submission_id
         debug_logger.log_info(
             f"[GENERATION] 开始生成 - 模型: {model}, 类型: {generation_type}, Prompt: {prompt[:50]}..."
         )
 
-        # 向用户展示开始信息
-        if stream:
+        # 向用户展示开始信息（重试时由 handle_generation 另行提示，拿到账号后再记日志）
+        if stream and attempt == 1:
             yield self._create_stream_chunk(
                 f"✨ {'视频' if generation_type == 'video' else '图片'}生成任务已启动\n",
                 role="assistant",
@@ -1646,6 +1767,8 @@ class GenerationHandler:
         debug_logger.log_info(f"[GENERATION] 正在选择可用Token...")
         token_select_started_at = time.time()
 
+        # Only a retry names accounts to avoid, so ordinary selection is unchanged.
+        avoid = {"exclude_token_ids": exclude_token_ids} if exclude_token_ids else {}
         if generation_type == "image":
             token = await self.load_balancer.select_token(
                 for_image_generation=True,
@@ -1653,6 +1776,7 @@ class GenerationHandler:
                 reserve=False,
                 enforce_concurrency_filter=False,
                 track_pending=True,
+                **avoid,
             )
         else:
             token = await self.load_balancer.select_token(
@@ -1661,12 +1785,20 @@ class GenerationHandler:
                 reserve=False,
                 enforce_concurrency_filter=False,
                 track_pending=True,
+                **avoid,
             )
         perf_trace["token_select_ms"] = int(
             (time.time() - token_select_started_at) * 1000
         )
 
         if not token:
+            fallback = (retry_state or {}).get("fallback")
+            if fallback:
+                # A retry with no other account to try: the first attempt's error
+                # stays the answer, and nothing new is logged for this attempt.
+                for chunk in fallback:
+                    yield chunk
+                return
             error_msg = None
             if self.load_balancer and hasattr(
                 self.load_balancer, "get_unavailable_reason"
@@ -1695,20 +1827,77 @@ class GenerationHandler:
             )
             if stream:
                 yield self._create_stream_chunk(f"错误: {error_msg}\n")
-            yield self._create_error_response(error_msg, status_code=503)
+            yield self._create_error_response(
+                error_msg, status_code=503, code="no_available_token", submission_pending=False, upstream_accepted=False
+            )
             return
 
         debug_logger.log_info(f"[GENERATION] 已选择Token: {token.id} ({token.email})")
+        selected_token_id = token.id
         pending_token_state["active"] = True
-        await self._update_request_log_progress(
-            request_log_state,
-            token_id=token.id,
-            status_text="token_selected",
-            progress=8,
-            response_extra={"token_email": token.email},
-        )
-
         try:
+            if client_submission_id:
+                await SubmissionLedger(self.db).update(client_submission_id, account_id=token.id)
+            await self._update_request_log_progress(
+                request_log_state,
+                token_id=token.id,
+                status_text="token_selected",
+                progress=8,
+                response_extra={"token_email": token.email},
+            )
+            concurrency_manager = getattr(self, "concurrency_manager", None)
+            if concurrency_manager is not None:
+                await self._update_request_log_progress(
+                    request_log_state, token_id=token.id,
+                    status_text="waiting_account_slot", progress=8,
+                )
+                wait_acquire = (
+                    concurrency_manager.wait_acquire_image
+                    if generation_type == "image"
+                    else concurrency_manager.wait_acquire_video
+                )
+                acquired, waited_ms = await wait_acquire(
+                    selected_token_id,
+                    timeout_seconds=(
+                        config.flow_image_slot_wait_timeout if generation_type == "image"
+                        else config.flow_video_slot_wait_timeout
+                    ),
+                )
+                perf_trace["account_slot_wait_ms"] = waited_ms
+                if not acquired:
+                    error_msg = "账号生成并发槽位等待超时，尚未提交上游生成"
+                    await self._log_request(
+                        selected_token_id, request_operation, request_payload,
+                        {"error": error_msg, "code": "submission_not_started",
+                         "submission_pending": False, "upstream_accepted": False,
+                         "performance": perf_trace},
+                        503, time.time() - start_time,
+                        log_id=request_log_state.get("id"), status_text="failed", progress=8,
+                    )
+                    yield self._create_error_response(
+                        error_msg, status_code=503, code="submission_not_started",
+                        submission_pending=False, upstream_accepted=False,
+                    )
+                    return
+                concurrency_slot_acquired = True
+                await self.load_balancer.release_pending(
+                    selected_token_id,
+                    for_image_generation=(generation_type == "image"),
+                    for_video_generation=(generation_type == "video"),
+                )
+                pending_token_state["active"] = False
+            if exit_rotation is not None:
+                # Hold the account route through submission and polling. A waiting
+                # request reloads the account after any due rotation finishes.
+                token = await exit_rotation.acquire(token, request_id)
+                rotation_lease_acquired = True
+
+                async def note_generation_sent():
+                    await exit_rotation.note_sent(selected_token_id, request_id)
+
+                sent_callback_context = self.flow_client.set_generation_sent_callback(note_generation_sent)
+                sent_callback_bound = True
+                self.flow_client._set_request_fingerprint({"proxy_url": token.proxy_url})
             # 3. 确保AT有效
             debug_logger.log_info(f"[GENERATION] 检查Token AT有效性...")
             if stream:
@@ -1726,6 +1915,7 @@ class GenerationHandler:
                 (time.time() - ensure_at_started_at) * 1000
             )
             if not token:
+                await mark_rotation_error()
                 error_msg = "Token AT无效或刷新失败"
                 debug_logger.log_error(f"[GENERATION] {error_msg}")
                 record_generation_result(
@@ -1733,7 +1923,9 @@ class GenerationHandler:
                 )
                 if stream:
                     yield self._create_stream_chunk(f"错误: {error_msg}\n")
-                yield self._create_error_response(error_msg, status_code=503)
+                yield self._create_error_response(
+                    error_msg, status_code=503, code="no_available_token", submission_pending=False, upstream_accepted=False
+                )
                 return
 
             # 4. 确保Project存在
@@ -1817,8 +2009,16 @@ class GenerationHandler:
                 (time.time() - generation_pipeline_started_at) * 1000
             )
 
+            # A submitted operation with unknown status must remain recoverable.
+            # Its state was persisted before yielding the error, because clients
+            # commonly close the stream immediately on an error event.
+            if generation_result.get("submission_pending"):
+                await mark_rotation_error()
+                return
+
             # 6. 记录使用
             if not generation_result.get("success"):
+                await mark_rotation_error()
                 error_msg = generation_result.get("error_message") or "生成未成功完成"
                 debug_logger.log_warning(
                     f"[GENERATION] 生成未成功，不扣次数: {error_msg}"
@@ -1851,10 +2051,13 @@ class GenerationHandler:
                 return
 
             is_video = generation_type == "video"
-            await self.token_manager.record_usage(token.id, is_video=is_video)
-
-            # 重置错误计数 (请求成功时清空连续错误计数)
-            await self.token_manager.record_success(token.id)
+            if not generation_result.get("usage_recorded"):
+                await self.token_manager.record_usage(token.id, is_video=is_video)
+                await self.token_manager.record_success(token.id)
+                generation_result["usage_recorded"] = True
+            self._record_routing_success(
+                token, generation_type, model, started_at=generation_result.get("routing_started_at"),
+            )
 
             debug_logger.log_info(f"[GENERATION] ✅ 生成成功完成")
 
@@ -1916,6 +2119,7 @@ class GenerationHandler:
             )
 
         except asyncio.CancelledError:
+            await mark_rotation_error()
             error_msg = "生成已取消: 客户端连接已断开"
             debug_logger.log_warning(f"[GENERATION] ⚠️ {error_msg}")
             duration = time.time() - start_time
@@ -1941,9 +2145,33 @@ class GenerationHandler:
             )
             raise
         except Exception as e:
+            await mark_rotation_error()
             error_msg = f"生成失败: {str(e)}"
+            # The native runner marks this only before arming its submit button.
+            # Never infer non-submission from an error string or stage name.
+            rejected = isinstance(e, FlowRPCRejected) and e.submission_rejected
+            unsubmitted = rejected or (
+                isinstance(e, BrowserCaptchaError)
+                and e.submission_pending is False
+            )
+            error_code = "submission_rejected" if rejected else ("submission_not_started" if unsubmitted else "generation_failed")
             debug_logger.log_error(f"[GENERATION] 生成失败: {error_msg}")
+            routing_opened = False
             if token:
+                routing_failure = getattr(self.load_balancer, "record_generation_failure", None)
+                if callable(routing_failure):
+                    try:
+                        routing_opened = await routing_failure(
+                            token.id, e, for_image_generation=generation_type == "image",
+                            for_video_generation=generation_type == "video", model=model, token=token,
+                        ) is True
+                    except Exception as routing_error:
+                        # Routing bookkeeping must not replace the original
+                        # submission evidence or its response to the caller.
+                        debug_logger.log_warning(
+                            f"[GENERATION] 路由冷却登记失败: token_id={token.id}, "
+                            f"error_type={type(routing_error).__name__}"
+                        )
                 if self._should_count_token_error(e):
                     await self.token_manager.record_error(token.id)
                 else:
@@ -1960,28 +2188,72 @@ class GenerationHandler:
             prompt_for_log = (
                 prompt if len(prompt) <= 2000 else f"{prompt[:2000]}...(truncated)"
             )
+            error_data = {"error": error_msg, "performance": perf_trace}
+            if unsubmitted:
+                error_data.update(code=error_code, submission_pending=False, upstream_accepted=False)
             await self._log_request(
                 token.id if token else None,
                 request_operation if generation_type else "generate_unknown",
                 request_payload if "request_payload" in locals() else {"model": model},
-                {"error": error_msg, "performance": perf_trace},
+                error_data,
                 500,
                 duration,
                 log_id=request_log_state.get("id"),
                 status_text="failed",
                 progress=request_log_state.get("progress", 0),
             )
+            error_chunks = []
             if stream:
-                yield self._create_stream_chunk(f"错误: {error_msg}\n")
-            yield self._create_error_response(error_msg, status_code=500)
+                error_chunks.append(self._create_stream_chunk(f"错误: {error_msg}\n"))
+            error_chunks.append(self._create_error_response(
+                error_msg, status_code=500, code=error_code,
+                submission_pending=False if unsubmitted else None,
+                upstream_accepted=False if unsubmitted else None,
+                reason=("unusual_activity" if 'UNUSUAL_ACTIVITY' in e.error_code else "upstream_rejected") if rejected else None,
+            ))
+            if (
+                retry_state is not None and retry_state.get("allow")
+                and generation_type == "video" and unsubmitted and routing_opened
+            ):
+                # Nothing reached upstream and this account is now cooling down for
+                # an account/route reason, so another account may run the request.
+                # The error is handed back instead of shown to the caller.
+                retry_state.update(retry=True, token_id=token.id, tail=error_chunks)
+                return
+            for chunk in error_chunks:
+                yield chunk
         finally:
-            if pending_token_state.get("active") and token and self.load_balancer:
-                await self.load_balancer.release_pending(
-                    token.id,
-                    for_image_generation=(generation_type == "image"),
-                    for_video_generation=(generation_type == "video"),
-                )
-                pending_token_state["active"] = False
+            try:
+                # Also cover clients closing the generator immediately after an
+                # internal error event, before the outer loop can resume.
+                if rotation_lease_acquired and not generation_result.get("success"):
+                    await mark_rotation_error()
+            finally:
+                try:
+                    if sent_callback_bound:
+                        self.flow_client.clear_generation_sent_callback(sent_callback_context)
+                        self.flow_client.clear_request_fingerprint()
+                finally:
+                    try:
+                        if pending_token_state.get("active") and selected_token_id is not None and self.load_balancer:
+                            await self.load_balancer.release_pending(
+                                selected_token_id,
+                                for_image_generation=(generation_type == "image"),
+                                for_video_generation=(generation_type == "video"),
+                            )
+                            pending_token_state["active"] = False
+                    finally:
+                        try:
+                            if rotation_lease_acquired:
+                                await exit_rotation.release(selected_token_id, request_id)
+                        finally:
+                            if concurrency_slot_acquired:
+                                release_slot = (
+                                    concurrency_manager.release_image
+                                    if generation_type == "image"
+                                    else concurrency_manager.release_video
+                                )
+                                await release_slot(selected_token_id)
 
     def _get_no_token_error_message(self, generation_type: str) -> str:
         """获取无可用Token时的详细错误信息"""
@@ -1990,12 +2262,29 @@ class GenerationHandler:
         else:
             return "没有可用的Token进行视频生成。所有Token都处于禁用、冷却、配额耗尽或已过期状态。"
 
+    def _record_routing_success(self, token, generation_type: str, model: str, *, started_at=None) -> None:
+        record = getattr(getattr(self, "load_balancer", None), "record_generation_success", None)
+        if not callable(record):
+            return
+        try:
+            record(
+                token.id, for_image_generation=generation_type == "image",
+                for_video_generation=generation_type == "video", model=model, token=token, started_at=started_at,
+            )
+        except Exception as routing_error:
+            debug_logger.log_warning(
+                f"[GENERATION] 路由冷却清理失败: token_id={token.id}, "
+                f"error_type={type(routing_error).__name__}"
+            )
+
     def _should_count_token_error(self, error: Exception) -> bool:
         """判断失败是否应计入 token 连续错误。
 
         reCAPTCHA 获取失败、验证码供应商错误、打码资源不足等问题通常不是账号本身异常；
         若将其纳入连续错误，会在回归测试或代理波动时把 token 自动打成 inactive。
         """
+        if isinstance(error, BrowserCaptchaError):
+            return False
         error_text = str(error or "").strip().lower()
         if not error_text:
             return True
@@ -2048,7 +2337,7 @@ class GenerationHandler:
             image_trace = perf_trace.setdefault("image_generation", {})
             image_trace["input_image_count"] = len(images) if images else 0
 
-        # 不在本地等待图片硬并发槽位；请求一到就直接向上游提交。
+        # 统一入口已取得账号硬并发槽位，此处直接执行图片生成链路。
         normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
 
         if image_trace is not None:
@@ -2469,7 +2758,7 @@ class GenerationHandler:
             video_trace = perf_trace.setdefault("video_generation", {})
             video_trace["input_image_count"] = len(images) if images else 0
 
-        # 不在本地等待视频硬并发槽位；请求一到就直接向上游提交。
+        # 统一入口已取得账号硬并发槽位，持有至视频轮询与结果处理结束。
         normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
 
         if video_trace is not None:
@@ -2565,8 +2854,14 @@ class GenerationHandler:
             end_media_id = None
             reference_images = []
 
+            native_frames = bool(model_config.get("native_frames"))
+            if native_frames and config.captcha_method != "browser":
+                raise BrowserCaptchaError("native_frame_prepare", "native_mode_required")
+
+            # Native Frames uploads these bytes within the same owned page as
+            # submission; it never sends them through the detached HTTP uploader.
             # I2V: 首尾帧处理
-            if video_type == "i2v" and images:
+            if video_type == "i2v" and images and not native_frames:
                 if image_count == 1:
                     # 只有1张图: 仅作为首帧
                     if stream:
@@ -2663,7 +2958,15 @@ class GenerationHandler:
             submit_started_at = time.time()
 
             # I2V: 首尾帧生成
-            if video_type == "i2v" and start_media_id:
+            if native_frames:
+                result = await self.flow_client.generate_video_frames(
+                    project_id=project_id, prompt=prompt,
+                    model_key=model_config["model_key"], aspect_ratio=model_config["aspect_ratio"],
+                    frame_images=images, resolution=model_config.get("resolution"),
+                    token_id=token.id, token_video_concurrency=token.video_concurrency,
+                    google_cookies=getattr(token, "google_cookies", None),
+                )
+            elif video_type == "i2v" and start_media_id:
                 if end_media_id:
                     # 有首尾帧
                     result = await self.flow_client.generate_video_start_end(
@@ -2776,6 +3079,7 @@ class GenerationHandler:
                     token_id=token.id,
                     token_video_concurrency=token.video_concurrency,
                     google_cookies=getattr(token, "google_cookies", None),
+                    **({"resolution": model_config["resolution"]} if model_config.get("resolution") else {}),
                 )
             if video_trace is not None:
                 video_trace["submit_generation_ms"] = int(
@@ -2786,8 +3090,13 @@ class GenerationHandler:
             if result.get("direct_media") and direct_video_url:
                 await self.token_manager.record_usage(token.id, is_video=True)
                 await self.token_manager.record_success(token.id)
-                if getattr(self, "load_balancer", None):
-                    self.load_balancer.clear_quota_cooldown(token.id, model_key)
+                if isinstance(generation_result, dict):
+                    generation_result["usage_recorded"] = True
+                routing_model = perf_trace.get("model", model_key) if isinstance(perf_trace, dict) else model_key
+                self._record_routing_success(
+                    token, "video", routing_model,
+                    started_at=(generation_result or {}).get("routing_started_at"),
+                )
                 if self.proxy_manager and hasattr(
                     self.proxy_manager,
                     "record_attempt_success",
@@ -2875,6 +3184,12 @@ class GenerationHandler:
                 scene_id=scene_id,
             )
             await self.db.create_task(task)
+            client_submission_id = (request_log_state or {}).get('client_submission_id')
+            if client_submission_id:
+                ledger = SubmissionLedger(self.db)
+                await ledger.accepted(client_submission_id, token.id, project_id, operations)
+                if stream:
+                    yield 'data: ' + json.dumps({'submission': ledger.public(client_submission_id, await ledger.get(client_submission_id))}, ensure_ascii=False) + '\n\n'
             await self._update_request_log_progress(
                 request_log_state,
                 token_id=token.id,
@@ -3216,7 +3531,7 @@ class GenerationHandler:
                     self._mark_generation_failed(generation_result, friendly_error)
                     if stream:
                         yield self._create_stream_chunk(f"错误: {friendly_error}\n")
-                    yield self._create_error_response(friendly_error, status_code=502)
+                    yield self._create_error_response(friendly_error, status_code=502, code='video_generation_failed', submission_pending=False, upstream_accepted=True)
                     return
 
                 elif status.startswith("MEDIA_GENERATION_STATUS_ERROR"):
@@ -3224,17 +3539,15 @@ class GenerationHandler:
                     error_msg = f"视频生成失败: {status}"
                     await self._fail_video_task(checked_operations, error_msg)
                     self._mark_generation_failed(generation_result, error_msg)
-                    yield self._create_error_response(error_msg, status_code=502)
+                    yield self._create_error_response(error_msg, status_code=502, code='video_generation_failed', submission_pending=False, upstream_accepted=True)
                     return
                     
                 elif status == "MEDIA_GENERATION_STATUS_ACTIVE" and attempt > 80:
-                    # 如果持续4分钟（80次 * 3秒 = 240秒）依然是 ACTIVE 状态，则判定为卡死
-                    error_msg = "视频生成超时 (上游卡顿超过4分钟，已自动取消)"
-                    await self._fail_video_task(checked_operations, error_msg)
-                    self._mark_generation_failed(generation_result, error_msg)
-                    if stream:
-                        yield self._create_stream_chunk(f"错误: {error_msg}\n")
-                    yield self._create_error_response(error_msg, status_code=504)
+                    # A local polling deadline does not cancel the upstream job.
+                    yield await self._video_status_unknown(
+                        token, operations, generation_result, request_log_state,
+                        reason="poll_deadline",
+                    )
                     return
 
             except Exception as e:
@@ -3242,23 +3555,17 @@ class GenerationHandler:
                 consecutive_poll_errors += 1
                 debug_logger.log_error(f"Poll error: {str(e)}")
                 if consecutive_poll_errors >= max_consecutive_poll_errors:
-                    error_msg = f"视频状态查询失败: {self._normalize_error_message(e)}"
-                    await self._fail_video_task(operations, error_msg)
-                    self._mark_generation_failed(generation_result, error_msg)
-                    if stream:
-                        yield self._create_stream_chunk(f"错误: {error_msg}\n")
-                    yield self._create_error_response(error_msg, status_code=502)
+                    yield await self._video_status_unknown(
+                        token, operations, generation_result, request_log_state,
+                        reason="poll_auth_failed" if re.search(r"401|UNAUTHENTICATED", str(e), re.I) else "poll_failed",
+                    )
                     return
                 continue
 
-        # 超时
-        if last_poll_error is not None:
-            error_msg = f"视频状态查询持续失败: {self._normalize_error_message(last_poll_error)}"
-        else:
-            error_msg = f"视频生成超时 (已轮询 {max_attempts} 次)"
-        await self._fail_video_task(operations, error_msg)
-        self._mark_generation_failed(generation_result, error_msg)
-        yield self._create_error_response(error_msg, status_code=504)
+        yield await self._video_status_unknown(
+            token, operations, generation_result, request_log_state,
+            reason="poll_failed" if last_poll_error is not None else "poll_deadline",
+        )
 
     # ========== 响应格式化 ==========
 
@@ -3334,8 +3641,20 @@ class GenerationHandler:
 
         return json.dumps(response, ensure_ascii=False)
 
-    def _create_error_response(self, error_message: str, status_code: int = 500) -> str:
-        """创建错误响应"""
+    def _create_error_response(
+        self,
+        error_message: str,
+        status_code: int = 500,
+        code: str = "generation_failed",
+        submission_pending: Optional[bool] = None,
+        upstream_accepted: Optional[bool] = None,
+        reason: Optional[str] = None,
+    ) -> str:
+        """创建错误响应
+
+        submission_pending=False 明确表示请求在提交到上游之前就被拒绝（例如没有可用账号），
+        客户端可据此放心清除"待确认"标记；None 表示不作声明。
+        """
         import json
 
         error = {
@@ -3344,10 +3663,16 @@ class GenerationHandler:
                 "type": "server_error"
                 if status_code >= 500
                 else "invalid_request_error",
-                "code": "generation_failed",
+                "code": code,
                 "status_code": status_code,
             }
         }
+        if submission_pending is not None:
+            error["error"]["submission_pending"] = submission_pending
+        if upstream_accepted is not None:
+            error['error']['upstream_accepted'] = upstream_accepted
+        if reason is not None:
+            error['error']['reason'] = reason
 
         return json.dumps(error, ensure_ascii=False)
 
