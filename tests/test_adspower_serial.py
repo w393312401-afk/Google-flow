@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import aiosqlite
+from fastapi import HTTPException
 from pydantic import ValidationError
 
 from src.api import admin
@@ -26,6 +27,7 @@ class AdsPowerSerialTests(unittest.IsolatedAsyncioTestCase):
                                 get_request_proxy_url=AsyncMock(return_value=''))
         self.manager = TokenManager(self.db, FlowClient(proxy_manager=proxy, db=self.db))
         self.enterContext(patch.object(admin, 'db', self.db))
+        self.enterContext(patch.object(admin, 'token_manager', self.manager))
 
     async def add(self, email, **overrides):
         fields = dict(st=f'st-{email}', email=email, login_account=email, google_cookies='cookies')
@@ -68,6 +70,31 @@ class AdsPowerSerialTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValidationError):
             admin.UpdateTokenRequest(adspower_serial=-1)
         self.assertIsNone(admin.UpdateTokenRequest().adspower_serial)
+
+    async def test_serial_endpoint_edits_only_the_serial_without_validating_cookies(self):
+        token_id = await self.add('dead@example.test', adspower_serial=5, ban_reason='429_rate_limit')
+        self.manager.flow_client.st_to_at = AsyncMock(side_effect=AssertionError('must not validate cookies'))
+        before = (await self.db.get_token(token_id)).model_dump()
+
+        result = await admin.set_adspower_serial(token_id, admin.AdsPowerSerialRequest(adspower_serial=9), token='admin')
+
+        self.assertEqual(result, {'success': True, 'adspower_serial': 9})
+        after = (await self.db.get_token(token_id)).model_dump()
+        self.assertEqual(after.pop('adspower_serial'), 9)
+        before.pop('adspower_serial')
+        self.assertEqual(after, before)
+
+    async def test_serial_endpoint_clears_with_zero_and_rejects_unknown_accounts(self):
+        token_id = await self.add('a@example.test', adspower_serial=5)
+
+        await admin.set_adspower_serial(token_id, admin.AdsPowerSerialRequest(adspower_serial=0), token='admin')
+        self.assertIsNone((await self.listed())['a@example.test'])
+
+        with self.assertRaises(HTTPException) as caught:
+            await admin.set_adspower_serial(999, admin.AdsPowerSerialRequest(adspower_serial=1), token='admin')
+        self.assertEqual(caught.exception.status_code, 404)
+        with self.assertRaises(ValidationError):
+            admin.AdsPowerSerialRequest(adspower_serial=-3)
 
 
 if __name__ == '__main__':

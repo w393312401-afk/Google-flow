@@ -691,6 +691,10 @@ class AddTokenRequest(BaseModel):
         return normalized
 
 
+class AdsPowerSerialRequest(BaseModel):
+    adspower_serial: int = Field(ge=0, le=1000000)  # 0 表示清除
+
+
 class UpdateTokenRequest(BaseModel):
     st: str = ""
     project_id: Optional[str] = None  # 用户可选输入project_id
@@ -1197,6 +1201,17 @@ async def delete_token(token_id: int, token: str = Depends(verify_admin_token)):
         return {"success": True, "message": "Token删除成功"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/api/tokens/{token_id}/adspower-serial")
+async def set_adspower_serial(
+    token_id: int, request: AdsPowerSerialRequest, token: str = Depends(verify_admin_token)
+):
+    """只修改 ADS 序号：不校验 Cookie，也不改动账号的其他任何字段。"""
+    if await token_manager.get_token(token_id) is None:
+        raise HTTPException(status_code=404, detail="Token不存在")
+    await db.update_token(token_id, adspower_serial=request.adspower_serial or None)
+    return {"success": True, "adspower_serial": request.adspower_serial or None}
 
 
 @router.post("/api/tokens/{token_id}/enable")
