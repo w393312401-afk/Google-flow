@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cp deploy/com.fly.flow2api.cookie-sync.plist /Users/fly/Library/LaunchAgents/:*)",
+      "Bash(launchctl bootstrap gui/501 /Users/fly/Library/LaunchAgents/com.fly.flow2api.cookie-sync.plist)",
+      "Bash(launchctl kickstart gui/501/com.fly.flow2api.cookie-sync)"
+    ]
+  }
+}
