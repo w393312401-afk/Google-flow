@@ -170,14 +170,16 @@ class RefreshScheduleConfigTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(due.auto_refresh_enabled)
         self.assertEqual(account_operation_source.get(), "system")
 
-    async def test_periodic_scope_remains_protocol_only_while_manual_scope_is_all_active(self):
+    async def test_periodic_scope_is_every_cookie_account_and_manual_scope_is_all_active(self):
         session_id = await self.add_token("legacy-session", protocol_mode="session", auto_refresh_enabled=False)
         missing_id = await self.add_token("missing-cookies", google_cookies="", auto_refresh_enabled=False)
         await self.save(enabled=True, refresh_interval_minutes=10, apply_to_active_tokens=True)
         with patch.object(self.manager, "_refresh_protocol_token", AsyncMock()) as periodic:
             await self.manager.run_protocol_refresh_once()
             periodic_ids = {call.args[0].id for call in periodic.await_args_list}
-        self.assertEqual(periodic_ids, {self.overdue})
+        # Current Flow sessions are Cookie based, so legacy-mode rows renew too;
+        # accounts without Cookies have nothing to renew.
+        self.assertEqual(periodic_ids, {self.overdue, session_id})
         async def successful_manual(item):
             return {"id": item.id, "success": True}
         with patch.object(admin, "_refresh_token_for_batch", AsyncMock(side_effect=successful_manual)) as manual:

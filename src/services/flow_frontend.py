@@ -561,9 +561,10 @@ class FlowFrontendMixin:
                 else str((previous or {}).get("mediaName") or operation_id)
             )
             video_url = cls._find_flow_content_url(record, "video")
-            status = (
-                "MEDIA_GENERATION_STATUS_SUCCESSFUL"
-                if video_url
+            error_code = cls._extract_frontend_rpc_error_code(record)
+            status = "MEDIA_GENERATION_STATUS_SUCCESSFUL" if video_url else (
+                "MEDIA_GENERATION_STATUS_FAILED"
+                if error_code
                 else "MEDIA_GENERATION_STATUS_ACTIVE"
             )
             metadata = dict(previous_operation.get("metadata") or {})
@@ -585,9 +586,21 @@ class FlowFrontendMixin:
                 previous.get("modelKey") if isinstance(previous, dict) else None,
             )
             metadata["video"] = video_info
+            error_message = {
+                "PUBLIC_ERROR_PROMINENT_PEOPLE_FILTER_FAILED": (
+                    "提示词或参考素材触发了人物安全过滤"
+                ),
+                "PUBLIC_ERROR_UNSAFE_GENERATION": "提示词或参考素材触发了内容安全过滤",
+            }.get(error_code, f"Flow 上游拒绝视频生成：{error_code}")
+            operation_body = {"name": operation_id, "metadata": metadata}
+            if error_code:
+                operation_body["error"] = {
+                    "code": error_code,
+                    "message": error_message,
+                }
             normalized.append(
                 {
-                    "operation": {"name": operation_id, "metadata": metadata},
+                    "operation": operation_body,
                     "name": operation_id,
                     "mediaName": media_name,
                     "projectId": (
@@ -600,6 +613,32 @@ class FlowFrontendMixin:
                     "frontendRpc": "jwpduf",
                 }
             )
+        if not normalized:
+            error_code = cls._extract_frontend_rpc_error_code(payload)
+            if error_code:
+                error_message = f"Flow 上游拒绝视频生成：{error_code}"
+                for previous in operations:
+                    operation_id = str(
+                        (previous or {}).get("name")
+                        or ((previous or {}).get("operation") or {}).get("name")
+                        or ""
+                    )
+                    normalized.append(
+                        {
+                            **previous,
+                            "operation": {
+                                **((previous or {}).get("operation") or {}),
+                                "name": operation_id,
+                                "error": {
+                                    "code": error_code,
+                                    "message": error_message,
+                                },
+                            },
+                            "status": "MEDIA_GENERATION_STATUS_FAILED",
+                            "progress": 45,
+                            "frontendRpc": "jwpduf",
+                        }
+                    )
         return {"operations": normalized or operations, "frontendRpc": "jwpduf"}
 
     @staticmethod
@@ -802,7 +841,7 @@ class FlowFrontendMixin:
             "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
             "Cookie": rpc_cookie_header,
             "Origin": "https://flow.google.com",
-            "Referer": f"https://flow.google.com{resolved_source_path}",
+            "Referer": "https://flow.google.com/",
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
@@ -827,9 +866,9 @@ class FlowFrontendMixin:
             redact_sensitive_logs=True,
             allow_http1_fallback=rpc_id == "nzlxg",
         )
-        xsrf_match = re.search(r'\["xsrf","([^"]+)"', response_text)
+        xsrf_match = re.search(r'\["xsrf"\s*,\s*"((?:\\.|[^"\\])*)"', response_text)
         if xsrf_match:
-            request_fields["at"] = xsrf_match.group(1)
+            request_fields["at"] = json.loads('"' + xsrf_match.group(1) + '"')
             response_text = await self._make_text_request(
                 method="POST",
                 url=url,
@@ -853,12 +892,15 @@ class FlowFrontendMixin:
     def _extract_stream_chat_at_token(bootstrap_text: str) -> str:
         """从 bootstrap HTML 提取 WIZ_global_data.SNlM0e（XSRF at token）。"""
         for pattern in (
-            r'"SNlM0e":"([^"]+)"',
+            r'"SNlM0e"\s*:\s*"((?:\\.|[^"\\])+)"',
             r"SNlM0e['\"]?\s*[:=]\s*['\"]([A-Za-z0-9_:\-.]+)['\"]",
         ):
             match = re.search(pattern, bootstrap_text)
             if match:
-                return match.group(1)
+                try:
+                    return json.loads('"' + match.group(1) + '"')
+                except ValueError:
+                    return match.group(1)
         return ""
 
     def _build_stream_chat_request(
@@ -878,7 +920,7 @@ class FlowFrontendMixin:
         inner = [
             str(session_id),
             [[[[str(prompt)]]]],
-            [f"projects/{project_id}", None, [recaptcha_token, 1], None, None, 3],
+            [f"projects/{project_id}", None, [recaptcha_token, 1], None, None, 1],
         ]
         return self._compact_json_dumps(
             [None, self._compact_json_dumps(inner)]

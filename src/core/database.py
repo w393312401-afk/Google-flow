@@ -276,6 +276,8 @@ class Database:
             yescaptcha_api_key = ""
             yescaptcha_base_url = "https://api.yescaptcha.com"
             yescaptcha_task_type = DEFAULT_YESCAPTCHA_TASK_TYPE
+            twocaptcha_api_key = ""
+            twocaptcha_base_url = "https://api.2captcha.com"
             remote_browser_base_url = ""
             remote_browser_api_key = ""
             remote_browser_timeout = 60
@@ -294,6 +296,10 @@ class Database:
                 )
                 yescaptcha_task_type = normalize_yescaptcha_task_type(
                     captcha_config.get("yescaptcha_task_type")
+                )
+                twocaptcha_api_key = captcha_config.get("twocaptcha_api_key", "")
+                twocaptcha_base_url = captcha_config.get(
+                    "twocaptcha_base_url", "https://api.2captcha.com"
                 )
                 remote_browser_base_url = captcha_config.get(
                     "remote_browser_base_url", ""
@@ -358,9 +364,9 @@ class Database:
                     remote_browser_base_url, remote_browser_api_key, remote_browser_timeout,
                     browser_count, personal_project_pool_size,
                     personal_max_resident_tabs, browser_personal_fresh_restart_every_n_solves,
-                    personal_idle_tab_ttl_seconds
+                    personal_idle_tab_ttl_seconds, twocaptcha_api_key, twocaptcha_base_url
                 )
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                 captcha_method,
@@ -375,6 +381,8 @@ class Database:
                 personal_max_resident_tabs,
                 browser_personal_fresh_restart_every_n_solves,
                 personal_idle_tab_ttl_seconds,
+                twocaptcha_api_key,
+                twocaptcha_base_url,
                 ),
             )
 
@@ -473,6 +481,8 @@ class Database:
                         capsolver_base_url TEXT DEFAULT 'https://api.capsolver.com',
                         captcharun_api_key TEXT DEFAULT '',
                         captcharun_base_url TEXT DEFAULT 'https://api.captcha-run.com',
+                        twocaptcha_api_key TEXT DEFAULT '',
+                        twocaptcha_base_url TEXT DEFAULT 'https://api.2captcha.com',
                         remote_browser_base_url TEXT DEFAULT '',
                         remote_browser_api_key TEXT DEFAULT '',
                         remote_browser_timeout INTEGER DEFAULT 60,
@@ -624,6 +634,8 @@ class Database:
                     ("ezcaptcha_base_url", "TEXT DEFAULT 'https://api.ez-captcha.com'"),
                     ("capsolver_api_key", "TEXT DEFAULT ''"),
                     ("capsolver_base_url", "TEXT DEFAULT 'https://api.capsolver.com'"),
+                    ("twocaptcha_api_key", "TEXT DEFAULT ''"),
+                    ("twocaptcha_base_url", "TEXT DEFAULT 'https://api.2captcha.com'"),
                     ("captcharun_api_key", "TEXT DEFAULT ''"),
                     (
                         "captcharun_base_url",
@@ -953,6 +965,8 @@ class Database:
                     capsolver_base_url TEXT DEFAULT 'https://api.capsolver.com',
                     captcharun_api_key TEXT DEFAULT '',
                     captcharun_base_url TEXT DEFAULT 'https://api.captcha-run.com',
+                    twocaptcha_api_key TEXT DEFAULT '',
+                    twocaptcha_base_url TEXT DEFAULT 'https://api.2captcha.com',
                     remote_browser_base_url TEXT DEFAULT '',
                     remote_browser_api_key TEXT DEFAULT '',
                     remote_browser_timeout INTEGER DEFAULT 60,
@@ -1468,6 +1482,25 @@ class Database:
             await db.execute("DELETE FROM token_health WHERE token_id = ?", (expected.id,))
             await db.commit()
             return True
+
+    async def update_token_if_cookie_matches(
+        self, token_id: int, expected_cookies: str, **kwargs
+    ) -> bool:
+        """Save a refresh without overwriting a newer account Cookie push."""
+        allowed = {
+            "google_cookies", "st", "at", "at_expires", "credits",
+            "user_paygate_tier", "last_st_refresh_at", "last_st_refresh_result",
+        }
+        if not kwargs or not set(kwargs).issubset(allowed):
+            raise ValueError("Invalid cookie refresh fields")
+        async with self._connect(write=True) as db:
+            assignments = ", ".join(f"{key} = ?" for key in kwargs)
+            cursor = await db.execute(
+                f"UPDATE tokens SET {assignments} WHERE id = ? AND COALESCE(google_cookies, '') = ?",
+                [*kwargs.values(), token_id, expected_cookies or ""],
+            )
+            await db.commit()
+            return cursor.rowcount > 0
 
     async def delete_token(self, token_id: int):
         """Delete token and related data"""
@@ -2709,6 +2742,8 @@ class Database:
             config.set_capsolver_base_url(captcha_config.capsolver_base_url)
             config.set_captcharun_api_key(captcha_config.captcharun_api_key)
             config.set_captcharun_base_url(captcha_config.captcharun_base_url)
+            config.set_twocaptcha_api_key(captcha_config.twocaptcha_api_key)
+            config.set_twocaptcha_base_url(captcha_config.twocaptcha_base_url)
             config.set_remote_browser_base_url(captcha_config.remote_browser_base_url)
             config.set_remote_browser_api_key(captcha_config.remote_browser_api_key)
             config.set_remote_browser_timeout(captcha_config.remote_browser_timeout)
@@ -2893,6 +2928,8 @@ class Database:
         capsolver_base_url: str = None,
         captcharun_api_key: str = None,
         captcharun_base_url: str = None,
+        twocaptcha_api_key: str = None,
+        twocaptcha_base_url: str = None,
         remote_browser_base_url: str = None,
         remote_browser_api_key: str = None,
         remote_browser_timeout: int = None,
@@ -3220,6 +3257,19 @@ class Database:
                     ),
                 )
 
+            # Keep the new provider update in the same transaction as the existing fields.
+            previous_captcha = dict(row) if row else {}
+            await db.execute(
+                "UPDATE captcha_config SET twocaptcha_api_key = ?, twocaptcha_base_url = ? WHERE id = 1",
+                (
+                    twocaptcha_api_key
+                    if twocaptcha_api_key is not None
+                    else previous_captcha.get("twocaptcha_api_key", ""),
+                    twocaptcha_base_url
+                    if twocaptcha_base_url is not None
+                    else previous_captcha.get("twocaptcha_base_url", "https://api.2captcha.com"),
+                ),
+            )
             await db.commit()
 
     # Plugin config operations

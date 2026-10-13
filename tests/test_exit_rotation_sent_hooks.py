@@ -48,7 +48,7 @@ class NativeSentHookTests(unittest.IsolatedAsyncioTestCase):
             return await context.new_page()
         self.browser._new_page = AsyncMock(side_effect=new_page)
         self.spec = {
-            "prompt": "a real prompt", "model_name": "requested-model",
+            "prompt": "a real prompt", "model_name": "BELUGA",
             "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT", "website_key": "fixture-key",
         }
         self.configure = self.enterContext(patch(
@@ -202,7 +202,7 @@ class NativeSentHookTests(unittest.IsolatedAsyncioTestCase):
                         if kind == "image":
                             await client._submit_browser_native_image(
                                 project_id="project", token_id=1, prompt="a real prompt",
-                                model_name="requested-model", aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT",
+                                model_name="BELUGA", aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT",
                             )
                         else:
                             await client._submit_browser_native_video(
@@ -241,12 +241,11 @@ class HttpSentHookTests(unittest.IsolatedAsyncioTestCase):
         with patch("src.services.flow_current.config") as cfg:
             cfg.captcha_method = "yescaptcha"
             return await self.client.generate_image(
-                "at", "project", "a real prompt", "requested-model", "IMAGE_ASPECT_RATIO_PORTRAIT",
+                "at", "project", "a real prompt", "BELUGA", "IMAGE_ASPECT_RATIO_PORTRAIT",
                 google_cookies="SID=fixture",
             )
 
     async def test_nonnative_image_counts_at_actual_post_once(self):
-        self.client._load_flow_frontend_bootstrap.side_effect = [RuntimeError("bootstrap network failure"), BOOTSTRAP]
         order = []
         self.observer.side_effect = lambda: order.append("count")
         response = self.post.return_value
@@ -255,7 +254,7 @@ class HttpSentHookTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order, ["count", "post"])
         self.observer.assert_awaited_once()
         self.post.assert_awaited_once()
-        self.assertEqual(self.client._get_recaptcha_token.await_count, 2)
+        self.assertEqual(self.client._get_recaptcha_token.await_count, 1)
 
     async def test_ambiguous_post_failure_cannot_retry_generation(self):
         self.post.side_effect = RuntimeError("connection lost after send")

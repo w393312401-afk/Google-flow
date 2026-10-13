@@ -50,7 +50,7 @@ class VideoInterruptionTests(unittest.IsolatedAsyncioTestCase):
         await self.handler.concurrency_manager.initialize([self.token])
         self.handler._get_base_url = Mock(return_value="http://offline.test")
         self.config = SimpleNamespace(flow_account_retries=1, flow_video_slot_wait_timeout=1,
-            max_poll_attempts=4, poll_interval=0, cache_enabled=False, captcha_method="browser")
+            video_timeout=0.35, poll_interval=0.1, cache_enabled=False, captcha_method="browser")
         self.enterContext(patch("src.services.generation_handler.config", self.config))
         self.started = asyncio.Event()
 

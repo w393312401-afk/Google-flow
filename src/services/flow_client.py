@@ -198,6 +198,21 @@ class _FlowClientBase(FlowFrontendMixin):
             "ogiZ0b", "YhhmEf", "nprQif", "eb1hJf", "MZZa6b", "fZytfe", "p0UkFb",
         })
 
+    def _set_captcha_request_context(self, context: Optional[Dict[str, Any]]):
+        if not hasattr(self, "_captcha_request_ctx"):
+            self._captcha_request_ctx = contextvars.ContextVar("flow_captcha_request", default=None)
+        self._captcha_request_ctx.set(dict(context) if context else None)
+
+    def _get_captcha_request_context(self) -> Dict[str, Any]:
+        context = self._captcha_request_ctx.get() if hasattr(self, "_captcha_request_ctx") else None
+        return dict(context) if context else {}
+
+    def _current_browser_ref(self, token_id: Optional[int]):
+        context = self._get_captcha_request_context()
+        if context.get("method") == "browser" and context.get("token_id") == token_id:
+            return context.get("browser_ref")
+        return None
+
     def _get_primary_accept_language(self, fallback: str = "zh-CN,zh;q=0.9") -> str:
         fingerprint = self.get_request_fingerprint()
         if isinstance(fingerprint, dict):
@@ -1366,6 +1381,7 @@ class _FlowClientBase(FlowFrontendMixin):
                         at_token=at,
                         json_data=json_data,
                         timeout=request_timeout,
+                        browser_ref=self._current_browser_ref(token_id),
                     )
                     self._set_request_fingerprint(fingerprint if fingerprint else None)
 
@@ -1394,7 +1410,9 @@ class _FlowClientBase(FlowFrontendMixin):
                             error_reason = (
                                 f"HTTP Error {status_code}: {response_text[:200]}"
                             )
-                        raise Exception(error_reason)
+                        error = RuntimeError(error_reason)
+                        error.browser_ref = _browser_ref
+                        raise error
 
                     result = json.loads(response_text) if response_text else {}
                 else:
@@ -1430,7 +1448,7 @@ class _FlowClientBase(FlowFrontendMixin):
                     attempt_trace.setdefault("http_attempts", []).append(
                         http_attempt_info
                     )
-                if not self._is_timeout_error(e) or attempt_index >= total_attempts - 1:
+                if getattr(e, "submission_uncertain", False) or not self._is_timeout_error(e) or attempt_index >= total_attempts - 1:
                     raise
 
                 if has_media_proxy and total_attempts > 1:
@@ -3195,6 +3213,7 @@ class _FlowClientBase(FlowFrontendMixin):
                 at_token=at,
                 json_data=payload,
                 timeout=self._get_video_submit_timeout(),
+                browser_ref=self._current_browser_ref(token_id),
             )
             self._set_request_fingerprint(fingerprint if fingerprint else None)
 
@@ -3219,7 +3238,9 @@ class _FlowClientBase(FlowFrontendMixin):
                         error_reason = f"{error_reason}: {error_message}"
                 elif raw_text:
                     error_reason = f"HTTP Error {status_code}: {raw_text[:200]}"
-                raise Exception(error_reason)
+                error = RuntimeError(error_reason)
+                error.browser_ref = _browser_ref
+                raise error
         else:
             raw_text = await self._make_text_request(
                 method="POST",
@@ -4640,18 +4661,19 @@ class _FlowClientBase(FlowFrontendMixin):
             not defer_browser_error_notification
             or not retry_reason
             or is_terminal_attempt
+            or (config.captcha_method == "browser" and "recaptcha" in error_str.lower())
         )
 
         if should_notify_browser:
             notify_reason = retry_reason or error_str[:120] or type(error).__name__
             await self._notify_browser_captcha_error(
-                browser_id=browser_id,
+                browser_id=getattr(error, "browser_ref", None) or browser_id,
                 project_id=project_id,
                 error_reason=notify_reason,
                 error_message=error_str,
             )
 
-        if not retry_reason:
+        if not retry_reason or getattr(error, "submission_uncertain", False):
             return False
 
         if is_terminal_attempt:
@@ -4696,6 +4718,7 @@ class _FlowClientBase(FlowFrontendMixin):
             ("ezcaptcha", "ezcaptcha_api_key"),
             ("capsolver", "capsolver_api_key"),
             ("captcharun", "captcharun_api_key"),
+            ("twocaptcha", "twocaptcha_api_key"),
         ):
             if str(getattr(config, attr, "") or "").strip():
                 return method
@@ -4708,14 +4731,21 @@ class _FlowClientBase(FlowFrontendMixin):
         """从 browser 请求句柄提取本次 harvest 对应的 Flow session id。"""
         if not isinstance(browser_ref, str):
             return None
-        browser_id, separator, request_ref = browser_ref.strip().partition(":")
+        raw = browser_ref.strip()
+        if raw.startswith("personal:"):
+            return raw.partition("personal:")[2] or None
+        browser_id, separator, request_ref = raw.partition(":")
         if not separator or not browser_id.isdigit() or not request_ref:
             return None
+        if request_ref.startswith("lease-"):
+            return request_ref.partition("/")[2] or None
         return request_ref
 
     def _get_retry_reason(self, error_str: str) -> Optional[str]:
         """判断是否需要重试，返回日志提示内容"""
         error_lower = error_str.lower()
+        if "browser captcha queue wait timeout" in error_lower:
+            return None
         if "error_no_slot_available_block" in error_lower:
             return "打码服务资源阻塞"
         if "error_no_slot_available" in error_lower:
@@ -4794,6 +4824,10 @@ class _FlowClientBase(FlowFrontendMixin):
             page_action = normalized_action
             task_type = "ReCaptchaV3"
             min_score = None
+        elif method == "twocaptcha":
+            page_action = normalized_action
+            task_type = "RecaptchaV3TaskProxyless"
+            min_score = 0.9
         else:
             page_action = normalized_action
             task_type = None
@@ -4838,18 +4872,22 @@ class _FlowClientBase(FlowFrontendMixin):
             error_reason: 已归类的错误原因
             error_message: 原始错误文本
         """
-        if config.captcha_method == "browser":
+        context = self._get_captcha_request_context()
+        if context.get("browser_ref") != browser_id or context.get("project_id") != project_id:
+            context = {}
+        method = context.get("method") or config.captcha_method
+        if method == "browser":
             try:
                 from .browser_captcha import BrowserCaptchaService
 
                 service = await BrowserCaptchaService.get_instance(self.db)
                 await service.report_error(
                     browser_id,
-                    error_reason=error_reason or error_message or "upstream_error",
+                    error_reason=error_message or error_reason or "upstream_error",
                 )
             except Exception:
                 pass
-        elif config.captcha_method == "extension":
+        elif method == "extension":
             try:
                 from .browser_captcha_extension import ExtensionCaptchaService
 
@@ -4861,7 +4899,7 @@ class _FlowClientBase(FlowFrontendMixin):
                 )
             except Exception:
                 pass
-        elif config.captcha_method == "personal" and project_id:
+        elif method == "personal" and project_id:
             try:
                 from .browser_captcha_personal import BrowserCaptchaService
 
@@ -4870,10 +4908,13 @@ class _FlowClientBase(FlowFrontendMixin):
                     project_id=project_id,
                     error_reason=error_reason or "",
                     error_message=error_message or "",
+                    token_id=context.get("token_id"),
+                    slot_id=context.get("slot_id"),
+                    issued_at=context.get("issued_at"),
                 )
             except Exception:
                 pass
-        elif config.captcha_method == "remote_browser" and browser_id:
+        elif method == "remote_browser" and browser_id:
             try:
                 session_id = quote(str(browser_id), safe="")
                 await self._call_remote_browser_service(
@@ -4892,18 +4933,24 @@ class _FlowClientBase(FlowFrontendMixin):
                 )
 
     async def _notify_browser_captcha_request_finished(
-        self, browser_id: Optional[Union[int, str]] = None
+        self, browser_id: Optional[Union[int, str]] = None, *, success: Optional[bool] = None,
     ):
         """通知有头浏览器：上游图片/视频请求已结束，可关闭对应打码浏览器。"""
-        if config.captcha_method == "browser":
+        context = self._get_captcha_request_context()
+        method = context.get("method") if context.get("browser_ref") == browser_id else None
+        method = method or config.captcha_method
+        if method == "browser":
             try:
                 from .browser_captcha import BrowserCaptchaService
 
                 service = await BrowserCaptchaService.get_instance(self.db)
-                await service.report_request_finished(browser_id)
+                if success is None:
+                    await service.report_request_finished(browser_id)
+                else:
+                    await service.report_request_finished(browser_id, success=success)
             except Exception:
                 pass
-        elif config.captcha_method == "remote_browser" and browser_id:
+        elif method == "remote_browser" and browser_id:
             try:
                 session_id = quote(str(browser_id), safe="")
                 await self._call_remote_browser_service(
@@ -4916,6 +4963,9 @@ class _FlowClientBase(FlowFrontendMixin):
                 debug_logger.log_warning(
                     f"[reCAPTCHA RemoteBrowser] 上报 finish 失败: {e}"
                 )
+        context = self._get_captcha_request_context()
+        if context.get("browser_ref") == browser_id:
+            self._set_captcha_request_context(None)
 
     def _generate_session_id(self) -> str:
         """生成sessionId: ;timestamp"""
@@ -5191,6 +5241,13 @@ class _FlowClientBase(FlowFrontendMixin):
             - 其他模式: browser_id 为 None
         """
         captcha_method = method_override or config.captcha_method
+        previous = self._get_captcha_request_context()
+        if previous.get("method") == "browser" and previous.get("owner") is asyncio.current_task():
+            await self._notify_browser_captcha_request_finished(previous.get("browser_ref"))
+        self._set_captcha_request_context({
+            "method": captcha_method, "token_id": token_id, "project_id": project_id,
+            "owner": asyncio.current_task(),
+        })
         debug_logger.log_info(
             f"[reCAPTCHA] 开始获取 token: method={captcha_method}, project_id={project_id}, action={action}"
         )
@@ -5259,14 +5316,15 @@ class _FlowClientBase(FlowFrontendMixin):
                         if token
                         else None
                     )
-                debug_logger.log_info(
-                    f"[reCAPTCHA] get_token 返回: {token[:50] if token else None}..."
-                )
+                debug_logger.log_info(f"[reCAPTCHA] 取码完成: success={bool(token)}")
                 fingerprint = (
                     solve_bundle.get("fingerprint")
                     if isinstance(solve_bundle, dict)
                     and isinstance(solve_bundle.get("fingerprint"), dict)
                     else None
+                )
+                harvest_session_id = (
+                    str((solve_bundle or {}).get("session_id") or "").strip() or None
                 )
                 if isinstance(solve_bundle, dict) and token:
                     session_cookies = solve_bundle.get("session_cookies")
@@ -5304,7 +5362,20 @@ class _FlowClientBase(FlowFrontendMixin):
                         f"UA={effective_ua[:120]}, Accept-Language={effective_lang or '<empty>'}"
                     )
                 self._set_request_fingerprint(fingerprint if token else None)
-                return token, None
+                browser_ref = (
+                    f"personal:{harvest_session_id}"
+                    if token and harvest_session_id
+                    else None
+                )
+                if token:
+                    self._set_captcha_request_context({
+                        "method": "personal", "browser_ref": browser_ref,
+                        "token_id": token_id, "project_id": project_id,
+                        "slot_id": (solve_bundle or {}).get("slot_id"),
+                        "issued_at": (solve_bundle or {}).get("issued_at"),
+                        "owner": asyncio.current_task(),
+                    })
+                return token, browser_ref
             except RuntimeError as e:
                 # 捕获 Docker 环境或依赖缺失的明确错误
                 error_msg = str(e)
@@ -5330,18 +5401,27 @@ class _FlowClientBase(FlowFrontendMixin):
                 token, browser_id, fingerprint = await service.get_token(
                     project_id, action, token_id=token_id
                 )
-                if token and not self._extract_browser_captcha_session_id(
+                if token and action == "CHAT_GENERATION" and not self._extract_browser_captcha_session_id(
                     browser_id
                 ):
                     debug_logger.log_warning(
                         "[reCAPTCHA Browser] harvest 未返回会话 id，生成请求可能被拒"
                     )
                 self._set_request_fingerprint(fingerprint if token else None)
+                if token:
+                    self._set_captcha_request_context({
+                        "method": "browser", "browser_ref": browser_id,
+                        "token_id": token_id, "project_id": project_id,
+                        "owner": asyncio.current_task(),
+                    })
                 return token, browser_id
             except BrowserCaptchaError:
                 self._set_request_fingerprint(None)
                 raise
             except RuntimeError as e:
+                from .browser_captcha import BrowserCaptchaQueueTimeout
+                if isinstance(e, BrowserCaptchaQueueTimeout):
+                    raise
                 # 捕获 Docker 环境或依赖缺失的明确错误
                 error_msg = str(e)
                 debug_logger.log_error(f"[reCAPTCHA Browser] {error_msg}")
@@ -5393,6 +5473,7 @@ class _FlowClientBase(FlowFrontendMixin):
         elif captcha_method in [
             "yescaptcha",
             "captcharun",
+            "twocaptcha",
             "capmonster",
             "ezcaptcha",
             "capsolver",
@@ -5507,6 +5588,9 @@ class _FlowClientBase(FlowFrontendMixin):
         elif method == "captcharun":
             client_key = config.captcharun_api_key
             base_url = config.captcharun_base_url
+        elif method == "twocaptcha":
+            client_key = config.twocaptcha_api_key
+            base_url = config.twocaptcha_base_url
         else:
             debug_logger.log_error(f"[reCAPTCHA] Unknown API method: {method}")
             return None
@@ -5562,6 +5646,15 @@ class _FlowClientBase(FlowFrontendMixin):
                 or (self.get_request_fingerprint() or {}).get("user_agent")
                 or self._generate_user_agent(str(project_id or method))
             ).strip()
+            if method == "twocaptcha":
+                from .twocaptcha import solve_recaptcha_v3
+
+                solution = await solve_recaptcha_v3(
+                    client_key, website_url, website_key, page_action,
+                    enterprise=True, base_url=base_url,
+                    proxy_url=resolved_proxy_url or None,
+                )
+                return solution["gRecaptchaResponse"], solution["userAgent"]
             if method == "captcharun":
                 headers = {
                     "Authorization": f"Bearer {client_key}",

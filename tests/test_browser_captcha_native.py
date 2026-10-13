@@ -1,6 +1,8 @@
 """Native captcha regressions; AST loading never installs or launches a browser."""
 import ast
 import asyncio
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -17,7 +19,7 @@ import unittest
 import uuid
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
@@ -36,8 +38,10 @@ namespace.update(
     LABS_URL="https://flow.google.com",
     BROWSER_SESSION_COOKIE_TARGET_URLS=("https://flow.google.com/",),
 )
-exec(compile(ast.Module(body=[node for node in tree.body if isinstance(node, ast.ClassDef)
-                             and node.name in {"TokenBrowser", "BrowserCaptchaService"}],
+exec(compile(ast.Module(body=[node for node in tree.body
+                             if (isinstance(node, ast.ClassDef)
+                                 and node.name in {"TokenBrowser", "_BrowserRequest", "BrowserCaptchaService"})
+                             or (isinstance(node, ast.FunctionDef) and node.name == "_resolve_flow_page_warmup_seconds")],
                         type_ignores=[]), str(SOURCE), "exec"), namespace)
 TokenBrowser = namespace["TokenBrowser"]
 BrowserCaptchaError = namespace["BrowserCaptchaError"]
@@ -236,7 +240,9 @@ process.stdout.write(JSON.stringify({
 
     def test_scoped_cookies_keep_original_scope(self):
         scoped = [{"name": "OSID", "value": "fake", "domain": "flow.google.com", "path": "/"}]
-        self.assertEqual(self.browser._build_google_cookie_targets(json.dumps(scoped)), scoped)
+        # Root-path host cookies are expressed by URL, which keeps the same scope.
+        self.assertEqual(self.browser._build_google_cookie_targets(json.dumps(scoped)), [
+            {"name": "OSID", "value": "fake", "url": "https://flow.google.com/"}])
 
     def test_private_diagnostics_are_bounded_and_allowlisted(self):
         for _ in range(80):
@@ -652,7 +658,7 @@ process.stdout.write(JSON.stringify(vm.runInContext(input.script, context)()));
         self.browser._apply_browser_environment_patch = AsyncMock()
         self.browser._prepare_flow_runtime_page = AsyncMock(return_value=True)
         self.browser._harvest_token_via_ui_submit = AsyncMock(return_value={"token": "synthetic", "session_id": "session", "transport": "batchexecute", "rpc": "ogiZ0b"})
-        token = await self.browser._execute_captcha(context, "project", "key", "IMAGE_GENERATION")
+        token = await self.browser._execute_captcha(context, "project", "key", "CHAT_GENERATION")
         self.assertEqual(token, "synthetic")
         self.assertEqual(self.browser.get_last_fingerprint(), {"user_agent": "synthetic-agent", "harvest_transport": "batchexecute", "harvest_rpc": "ogiZ0b"})
 
@@ -725,6 +731,14 @@ process.stdout.write(JSON.stringify(vm.runInContext(input.script, context)()));
         service._stats = {"req_total": 0, "gen_ok": 0, "gen_fail": 0, "api_403": 0}
         service._token_semaphore = asyncio.Semaphore(1)
         service._slot_allocation_lock = asyncio.Lock()
+        service._slot_condition = asyncio.Condition(service._slot_allocation_lock)
+        service._slot_recovery = {}
+        service._requests = {}
+        service._cleanup_tasks = set()
+        service._closed = False
+        service._queue_timeouts = 0
+        service._queue_wait_total_seconds = 0.0
+        service._admitted_requests = 0
         service._browsers_lock = asyncio.Lock()
         service._slot_reservations = {}
         service._browsers = {0: self.browser}

@@ -18,7 +18,7 @@ class VideoStatusUnknownTests(unittest.IsolatedAsyncioTestCase):
         self.result = self.handler._create_generation_result()
 
     async def poll(self, attempts=4):
-        with patch("src.services.generation_handler.config", SimpleNamespace(max_poll_attempts=attempts, poll_interval=0)), patch("src.services.generation_handler.asyncio.sleep", new=AsyncMock()):
+        with patch("src.services.generation_handler.config", SimpleNamespace(video_timeout=attempts * 0.1 - 0.05, poll_interval=0.1)), patch("src.services.generation_handler.asyncio.sleep", new=AsyncMock()):
             return [chunk async for chunk in self.handler._poll_video_result(
                 self.token, "project", self.operations, False,
                 generation_result=self.result, request_log_state=self.state,

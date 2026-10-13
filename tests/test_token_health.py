@@ -53,7 +53,10 @@ class TokenHealthTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "src.services.protocol_login.protocol_loginer.login",
                 new_callable=AsyncMock,
-                return_value={"success": True, "session_token": "recovered-session"},
+                return_value={
+                    "success": True, "google_cookies": "OSID=new-osid; SID=new-sid",
+                    "email": "health@example.com",
+                },
             )
         )
 
@@ -133,13 +136,14 @@ class TokenHealthTests(unittest.IsolatedAsyncioTestCase):
         result = await self.manager.ensure_valid_token(await self.token())
         self.assertIsNotNone(result)
         self.assertTrue(result.is_active)
-        self.assertEqual(result.st, "recovered-session")
+        self.assertTrue(result.st.startswith("frontend-"))
+        self.assertEqual(result.google_cookies, "OSID=new-osid; SID=new-sid")
         self.assertEqual(result.credits, 123)
         self.protocol_login.assert_awaited_once()
         self.assertTrue(self.manager._has_recent_at_validation(self.token_id))
         self.assertIsNone(self.manager.get_last_validation_error(self.token_id))
         self.assertIsNotNone(await self.manager.ensure_valid_token(result))
-        self.assertEqual(self.flow._current_rpc.await_count, 4)
+        self.assertEqual(self.flow._current_rpc.await_count, 3)
 
     async def test_explicit_auth_rejection_after_recovery_disables(self):
         self.flow._current_rpc.side_effect = RuntimeError(AUTH_ERROR)
@@ -327,7 +331,7 @@ class TokenHealthTests(unittest.IsolatedAsyncioTestCase):
         await self.db.update_token(self.token_id, auto_refresh_enabled=True)
         original = await self.token()
         self.manager._mark_at_valid(self.token_id)
-        self.flow._current_rpc.side_effect = [[123], RuntimeError("HTTP 503")]
+        self.flow._current_rpc.side_effect = RuntimeError("HTTP 503")
         await self.manager._refresh_protocol_token(original, datetime.now(timezone.utc))
         await self.assert_unavailable_and_active()
         self.assertEqual((await self.token()).at_expires, original.at_expires)

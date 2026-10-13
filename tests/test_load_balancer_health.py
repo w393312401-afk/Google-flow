@@ -108,7 +108,7 @@ class LoadBalancerHealthTests(unittest.IsolatedAsyncioTestCase):
     async def test_last_candidate_disabled_retains_only_this_selection_reason(self):
         token_id = await self.add_token()
         self.failures[token_id] = "HTTP 401"
-        self.manager._try_refresh_st = AsyncMock(return_value="recovered-session")
+        self.manager._try_refresh_st = AsyncMock(return_value=None)
         self.assertIsNone(await self.balancer.select_token(for_video_generation=True, model="test-2k"))
         self.assertFalse((await self.db.get_token(token_id)).is_active)
         reason = await self.balancer.get_unavailable_reason(for_video_generation=True, model="test-2k")
@@ -119,7 +119,7 @@ class LoadBalancerHealthTests(unittest.IsolatedAsyncioTestCase):
     async def test_disabled_last_candidate_reason_reaches_generation_503_and_request_log(self):
         token_id = await self.add_token()
         self.failures[token_id] = "HTTP 401"
-        self.manager._try_refresh_st = AsyncMock(return_value="recovered-session")
+        self.manager._try_refresh_st = AsyncMock(return_value=None)
         handler = GenerationHandler.__new__(GenerationHandler)
         handler.flow_client = self.flow
         handler.token_manager = self.manager

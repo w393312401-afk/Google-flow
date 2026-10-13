@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import importlib
+import sys
 import json
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Header, Request, Response
@@ -58,6 +59,7 @@ ADMIN_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60
 SUPPORTED_API_CAPTCHA_METHODS = {
     "yescaptcha",
     "captcharun",
+    "twocaptcha",
     "capmonster",
     "ezcaptcha",
     "capsolver",
@@ -469,6 +471,16 @@ async def _solve_recaptcha_with_api_service(
         base_url = config.captcharun_base_url
         task_type = "ReCaptchaV3"
         min_score = None
+    elif method == "twocaptcha":
+        from ..services.twocaptcha import solve_recaptcha_v3
+
+        proxy_url = await proxy_manager.get_request_proxy_url() if proxy_manager else None
+        solution = await solve_recaptcha_v3(
+            config.twocaptcha_api_key, website_url, website_key, action,
+            enterprise=enterprise, base_url=config.twocaptcha_base_url,
+            proxy_url=proxy_url,
+        )
+        return solution["gRecaptchaResponse"]
     else:
         raise RuntimeError(f"不支持的打码方式: {method}")
 
@@ -2201,6 +2213,17 @@ async def update_captcha_config(
     capsolver_base_url = request.get("capsolver_base_url")
     captcharun_api_key = request.get("captcharun_api_key")
     captcharun_base_url = request.get("captcharun_base_url")
+    twocaptcha_api_key = request.get("twocaptcha_api_key")
+    twocaptcha_base_url = request.get("twocaptcha_base_url")
+    if twocaptcha_api_key is not None and not isinstance(twocaptcha_api_key, str):
+        return {"success": False, "message": "2Captcha API Key 必须是字符串"}
+    if twocaptcha_base_url is not None:
+        if not isinstance(twocaptcha_base_url, str):
+            return {"success": False, "message": "2Captcha API 地址必须是字符串"}
+        try:
+            twocaptcha_base_url = _normalize_http_base_url(twocaptcha_base_url.strip() or "https://api.2captcha.com")
+        except RuntimeError as exc:
+            return {"success": False, "message": str(exc)}
     remote_browser_base_url = request.get("remote_browser_base_url")
     remote_browser_api_key = request.get("remote_browser_api_key")
     remote_browser_timeout = request.get("remote_browser_timeout", 60)
@@ -2272,6 +2295,8 @@ async def update_captcha_config(
         capsolver_base_url=capsolver_base_url,
         captcharun_api_key=captcharun_api_key,
         captcharun_base_url=captcharun_base_url,
+        twocaptcha_api_key=twocaptcha_api_key,
+        twocaptcha_base_url=twocaptcha_base_url,
         remote_browser_base_url=remote_browser_base_url,
         remote_browser_api_key=remote_browser_api_key,
         remote_browser_timeout=remote_browser_timeout,
@@ -2342,6 +2367,8 @@ async def get_captcha_config(token: str = Depends(verify_admin_token)):
         "capsolver_base_url": captcha_config.capsolver_base_url,
         "captcharun_api_key": captcha_config.captcharun_api_key,
         "captcharun_base_url": captcha_config.captcharun_base_url,
+        "twocaptcha_api_key": captcha_config.twocaptcha_api_key,
+        "twocaptcha_base_url": captcha_config.twocaptcha_base_url,
         "remote_browser_base_url": captcha_config.remote_browser_base_url,
         "remote_browser_api_key": captcha_config.remote_browser_api_key,
         "remote_browser_timeout": captcha_config.remote_browser_timeout,
@@ -2353,6 +2380,18 @@ async def get_captcha_config(token: str = Depends(verify_admin_token)):
         "browser_personal_fresh_restart_every_n_solves": captcha_config.browser_personal_fresh_restart_every_n_solves,
         "personal_idle_tab_ttl_seconds": captcha_config.personal_idle_tab_ttl_seconds,
     }
+
+
+@router.get("/api/captcha/browser-stats")
+async def get_browser_captcha_stats(token: str = Depends(verify_admin_token)):
+    """Inspect existing browser slots without starting a browser runtime."""
+    if config.captcha_method != "browser":
+        return {"captcha_method": config.captcha_method, "running": False, "browsers": []}
+    module = sys.modules.get("src.services.browser_captcha")
+    service = module.BrowserCaptchaService._instance if module else None
+    if service is None:
+        return {"captcha_method": "browser", "running": False, "browsers": []}
+    return {"captcha_method": "browser", "running": not service._closed, **service.get_stats()}
 
 
 @router.post("/api/captcha/score-test")

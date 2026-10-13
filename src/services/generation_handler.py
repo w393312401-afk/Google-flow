@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import json
+import math
 import re
 import time
 from copy import deepcopy
@@ -25,6 +26,18 @@ from .captcha_errors import BrowserCaptchaError
 from .flow_frontend import FlowRPCRejected
 from .submission_ledger import SubmissionLedger
 from ..core.account_admission import AccountAdmissionBusy
+
+
+def _video_poll_attempt_budget(
+    timeout_seconds: float,
+    poll_interval: float,
+    *,
+    upsample: bool = False,
+) -> int:
+    interval = max(0.1, float(poll_interval or 0))
+    timeout = max(interval, float(timeout_seconds or 0))
+    attempts = max(1, math.ceil(timeout / interval))
+    return attempts * (3 if upsample else 1)
 
 
 # Model configuration
@@ -117,100 +130,89 @@ MODEL_CONFIG = {
         "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K",
     },
-    # 图片生成 - IMAGEN_3_5 (Imagen 4.0)
-    "imagen-4.0-generate-preview-landscape": {
-        "type": "image",
-        "model_name": "IMAGEN_3_5",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE",
-    },
-    "imagen-4.0-generate-preview-portrait": {
-        "type": "image",
-        "model_name": "IMAGEN_3_5",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT",
-    },
-    # 图片生成 - NARWHAL (新版)
+    # 图片生成 - BELUGA (Nano Banana 2.1)
     "gemini-3.1-flash-image-landscape": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE",
     },
     "gemini-3.1-flash-image-portrait": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT",
     },
     "gemini-3.1-flash-image-square": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_SQUARE",
     },
     "gemini-3.1-flash-image-four-three": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE",
     },
     "gemini-3.1-flash-image-three-four": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR",
     },
     "gemini-3.1-flash-image-landscape-2k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K",
     },
     "gemini-3.1-flash-image-portrait-2k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K",
     },
     "gemini-3.1-flash-image-square-2k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_SQUARE",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K",
     },
     "gemini-3.1-flash-image-four-three-2k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K",
     },
     "gemini-3.1-flash-image-three-four-2k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K",
     },
     "gemini-3.1-flash-image-landscape-4k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K",
     },
     "gemini-3.1-flash-image-portrait-4k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K",
     },
     "gemini-3.1-flash-image-square-4k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_SQUARE",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K",
     },
     "gemini-3.1-flash-image-four-three-4k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K",
     },
     "gemini-3.1-flash-image-three-four-4k": {
         "type": "image",
-        "model_name": "NARWHAL",
+        "model_name": "BELUGA",
         "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR",
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K",
     },
@@ -1119,21 +1121,28 @@ def _apply_current_flow_model_catalog():
     for config_entry in MODEL_CONFIG.values():
         config_entry["listed"] = False
 
-    # NARWHAL remains the current image-generation RPC model. Older image
-    # aliases continue to resolve but no longer clutter the public catalog.
-    for model_id, config_entry in MODEL_CONFIG.items():
-        if (
-            config_entry.get("type") == "image"
-            and config_entry.get("model_name") == "NARWHAL"
-        ):
-            config_entry["listed"] = True
-            config_entry["display_name"] = "Flow Image - NARWHAL"
-
     def register(model_id: str, config_entry: Dict[str, Any], display_name: str):
         config_entry = dict(config_entry)
         config_entry["listed"] = True
         config_entry["display_name"] = display_name
         MODEL_CONFIG[model_id] = config_entry
+
+    image_variants = [
+        (model_id, dict(entry)) for model_id, entry in MODEL_CONFIG.items()
+        if entry.get("type") == "image"
+        and model_id.startswith("gemini-3.1-flash-image-")
+        and entry.get("model_name") == "BELUGA"
+    ]
+    for model_id, entry in image_variants:
+        entry["model_name"] = "BELUGA"
+        register(model_id, entry, "Nano Banana 2.1")
+        lite_entry = dict(entry)
+        lite_entry["model_name"] = "HARBOR_SEAL"
+        register(
+            model_id.replace("gemini-3.1-flash-image-", "gemini-3.1-flash-lite-image-", 1),
+            lite_entry,
+            "Nano Banana 2 Lite",
+        )
 
     def t2v(model_key: str, aspect_ratio: str) -> Dict[str, Any]:
         return _make_t2v_config(
@@ -2381,6 +2390,8 @@ class GenerationHandler:
             "yescaptcha",
             "capsolver",
             "captcharun",
+            "twocaptcha",
+            "2captcha",
             "capmonster",
             "ezcaptcha",
         )
@@ -3359,26 +3370,39 @@ class GenerationHandler:
             response_state = self._create_response_state()
 
         normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
-        max_attempts = config.max_poll_attempts
-        poll_interval = config.poll_interval
-        
-        # 如果需要放大，轮询次数加倍（放大可能需要 30 分钟）
-        if upsample_config:
-            max_attempts = max_attempts * 3  # 放大需要更长时间
+        poll_interval = max(0.1, float(config.poll_interval))
+        max_attempts = _video_poll_attempt_budget(
+            config.video_timeout,
+            poll_interval,
+            upsample=bool(upsample_config),
+        )
+        poll_budget_seconds = max_attempts * poll_interval
+        poll_deadline = time.monotonic() + poll_budget_seconds
 
         consecutive_poll_errors = 0
         last_poll_error: Optional[Exception] = None
         max_consecutive_poll_errors = 3
 
         for attempt in range(max_attempts):
-            await asyncio.sleep(poll_interval)
+            remaining = poll_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(poll_interval, remaining))
+            remaining = poll_deadline - time.monotonic()
+            if remaining <= 0:
+                break
 
             try:
-                result = await self.flow_client.check_video_status(
-                    token.at,
-                    operations,
-                    token_id=token.id,
-                    google_cookies=getattr(token, "google_cookies", None),
+                # Include the status RPC itself in the wall-time budget. The outer
+                # deadline prevents slow retries from extending video_timeout.
+                result = await asyncio.wait_for(
+                    self.flow_client.check_video_status(
+                        token.at,
+                        operations,
+                        token_id=token.id,
+                        google_cookies=getattr(token, "google_cookies", None),
+                    ),
+                    timeout=remaining,
                 )
                 checked_operations = result.get("operations", [])
                 consecutive_poll_errors = 0
@@ -3657,14 +3681,6 @@ class GenerationHandler:
                     yield self._create_error_response(error_msg, status_code=502, code='video_generation_failed', submission_pending=False, upstream_accepted=True)
                     return
                     
-                elif status == "MEDIA_GENERATION_STATUS_ACTIVE" and attempt > 80:
-                    # A local polling deadline does not cancel the upstream job.
-                    yield await self._video_status_unknown(
-                        token, operations, generation_result, request_log_state,
-                        reason="poll_deadline",
-                    )
-                    return
-
             except Exception as e:
                 last_poll_error = e
                 consecutive_poll_errors += 1

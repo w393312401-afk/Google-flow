@@ -20,6 +20,7 @@ from .captcha_errors import BrowserCaptchaError
 
 class CurrentFlowClientMixin:
     FRONTEND_ACCESS_TOKEN = "flow-frontend-cookie"
+    CURRENT_IMAGE_MODELS = frozenset({"BELUGA", "HARBOR_SEAL", "GEM_PIX_2"})
 
     def _get_runtime_config(self):
         raise NotImplementedError
@@ -139,6 +140,7 @@ class CurrentFlowClientMixin:
             "expires": expires.isoformat().replace("+00:00", "Z"),
             "user": {},
             "credits": credits.get("credits", 0),
+            "userPaygateTier": credits.get("userPaygateTier"),
         }
 
     async def create_project(
@@ -303,7 +305,6 @@ class CurrentFlowClientMixin:
             website_url=self._build_flow_frontend_project_page_url(
                 normalized_project_id
             ),
-            method_override=self._resolve_batchexecute_captcha_override(),
         )
         if not recaptcha_token:
             raise RuntimeError("Failed to obtain reCAPTCHA token for image upload")
@@ -379,6 +380,13 @@ class CurrentFlowClientMixin:
         progress_callback: Optional[Callable[[str, int], Awaitable[None]]] = None,
         google_cookies: Optional[str] = None,
     ) -> tuple[dict, str, Dict[str, Any]]:
+        # Older internal callers may still use the retired Nano Banana 2 key.
+        # Update it before submission; never retry an unavailable current model
+        # with a retired upstream field.
+        if model_name == "NARWHAL":
+            model_name = "BELUGA"
+        if model_name not in self.CURRENT_IMAGE_MODELS:
+            raise ValueError(f"Unsupported Flow image model: {model_name}")
         await self._frontend_cookie(google_cookies, token_id)
         max_retries = max(1, int(self._get_runtime_config().flow_max_retries or 1))
         trace: Dict[str, Any] = {"max_retries": max_retries, "generation_attempts": []}
@@ -425,10 +433,16 @@ class CurrentFlowClientMixin:
         for retry_attempt in range(max_retries):
             started_at = time.time()
             browser_id = None
-            attempt = {"attempt": retry_attempt + 1, "recaptcha_ok": False}
+            submission_accepted = False
+            attempt = {
+                "attempt": retry_attempt + 1, "recaptcha_ok": False,
+                "image_model_name": model_name,
+            }
             try:
                 if progress_callback:
                     await progress_callback("solving_image_captcha", 38)
+                # The selected captcha provider supplies a token; the main
+                # client always submits explicit model and generation parameters.
                 token, browser_id = await self._get_recaptcha_token(
                     project_id,
                     action="IMAGE_GENERATION",
@@ -460,6 +474,7 @@ class CurrentFlowClientMixin:
                         self._get_runtime_config().flow_image_request_timeout, 90
                     ),
                 )
+                submission_accepted = True
                 result = self._normalize_frontend_image_generation_response(payload)
                 attempt["success"] = True
                 attempt["duration_ms"] = int((time.time() - started_at) * 1000)
@@ -472,28 +487,37 @@ class CurrentFlowClientMixin:
                 attempt["error"] = str(error)[:240]
                 attempt["duration_ms"] = int((time.time() - started_at) * 1000)
                 trace["generation_attempts"].append(attempt)
-                if self._generation_request_was_sent():
+                if (
+                    self._generation_request_was_sent()
+                    or submission_accepted
+                    or bool(getattr(error, "outcome_unknown", False))
+                    or bool(getattr(error, "submission_uncertain", False))
+                ):
                     raise
+                retry_handler = getattr(
+                    self, "_handle_retryable_generation_error", None
+                )
+                if retry_handler is not None:
+                    should_retry = await retry_handler(
+                        error,
+                        retry_attempt,
+                        max_retries,
+                        browser_id,
+                        project_id,
+                        "Personal image generation",
+                    )
+                    if not should_retry:
+                        raise
                 if retry_attempt >= max_retries - 1:
                     raise
             finally:
-                await self._notify_browser_captcha_request_finished(browser_id)
+                if isinstance(browser_id, str) and ":lease-" in browser_id:
+                    await self._notify_browser_captcha_request_finished(
+                        browser_id, success=submission_accepted,
+                    )
+                else:
+                    await self._notify_browser_captcha_request_finished(browser_id)
         raise last_error or RuntimeError("Flow frontend image generation failed")
-
-    def _resolve_batchexecute_captcha_override(self) -> Optional[str]:
-        """Select a solver for HTTP submissions that have no native browser path."""
-        if config.captcha_method not in ("browser", "personal", "remote_browser", "extension"):
-            return None
-        method = self._resolve_third_party_captcha_method()
-        if not method:
-            raise RuntimeError(
-                "当前浏览器打码模式不支持该 Flow RPC；请先配置 YesCaptcha、"
-                "Captcha.run、CapMonster、EzCaptcha 或 CapSolver API Key"
-            )
-        debug_logger.log_info(
-            f"[batchexecute] 使用第三方打码方式: {method} (configured={config.captcha_method})"
-        )
-        return method
 
     async def upsample_image(
         self,
@@ -506,14 +530,12 @@ class CurrentFlowClientMixin:
         token_id: Optional[int] = None,
         google_cookies: Optional[str] = None,
     ) -> str:
-        # SPrCad(batchexecute) 只接受第三方打码 token；browser/personal harvest
-        # 的 token 会被 UNUSUAL_ACTIVITY 拒绝（实测矩阵）。
+        # Each protected RPC uses the selected provider and its own action token.
         token, browser_id = await self._get_recaptcha_token(
             project_id,
             action="IMAGE_GENERATION",
             token_id=token_id,
             website_url=self._build_flow_frontend_project_page_url(project_id),
-            method_override=self._resolve_batchexecute_captcha_override(),
         )
         if not token:
             raise RuntimeError("Failed to obtain reCAPTCHA token for image upsample")
@@ -587,7 +609,6 @@ class CurrentFlowClientMixin:
             )
         if frame_images:
             raise BrowserCaptchaError("native_frame_prepare", "native_mode_required")
-        captcha_override = self._resolve_batchexecute_captcha_override()
         max_retries = max(1, int(self._get_runtime_config().flow_max_retries or 1))
         last_error: Optional[Exception] = None
         for retry_attempt in range(max_retries):
@@ -598,7 +619,6 @@ class CurrentFlowClientMixin:
                     action="VIDEO_GENERATION",
                     token_id=token_id,
                     website_url=self._build_flow_frontend_project_page_url(project_id),
-                    method_override=captcha_override,
                 )
                 if not token:
                     raise RuntimeError("Failed to obtain reCAPTCHA token")
@@ -608,8 +628,8 @@ class CurrentFlowClientMixin:
                     model_key=model_key,
                     aspect_ratio=aspect_ratio,
                     recaptcha_token=token,
-                    # 视频 batchexecute 通道固定使用第三方打码，每次请求生成
-                    # 独立 session id，不复用任何 browser harvest 会话。
+                    # Protocol requests use an independent session id instead of
+                    # a native StreamChat session.
                     session_id=str(uuid.uuid4()).upper(),
                     mode=mode,
                     reference_media_ids=reference_media_ids,

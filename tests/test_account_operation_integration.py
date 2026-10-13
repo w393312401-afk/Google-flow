@@ -215,27 +215,34 @@ class AccountOperationIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({row["source"] for row in await self.rows(operation="enable")}, {"login_host"})
         self.assertEqual({row["source"] for row in await self.rows(operation="disable")}, {"cookie_sync"})
 
-    async def personal_refresh(self, *, result=None, error=None):
+    NEW_COOKIES = "OSID=SECRET_NEW_OSID; SID=SECRET_NEW_SID"
+
+    async def personal_refresh(self, *, result=None, error=None, validation=None):
         await self.db.update_token(self.token_id, current_project_id="isolated-personal-project")
         token = await self.db.get_token(self.token_id)
-        browser = SimpleNamespace(refresh_session_token=AsyncMock(return_value=result, side_effect=error))
-        with patch("src.core.config.config", SimpleNamespace(captcha_method="personal")), \
+        browser = SimpleNamespace(refresh_google_cookies=AsyncMock(return_value=result, side_effect=error))
+        validate = AsyncMock(return_value={"access_token": "SECRET_NEW_AT", "credits": 9}, side_effect=validation)
+        with patch("src.services.token_manager.config", SimpleNamespace(captcha_method="personal")), \
+             patch.object(self.manager, "_try_protocol_refresh_st", AsyncMock(return_value=None)), \
+             patch.object(self.manager, "_st_to_at_for_token", validate), \
              patch("src.services.browser_captcha_personal.BrowserCaptchaService.get_instance", AsyncMock(return_value=browser)):
             outcome = await self.manager._try_refresh_st(self.token_id, token)
         return outcome, browser
 
-    async def test_personal_new_session_is_logged_without_claiming_at_validation(self):
+    async def test_personal_new_cookies_are_validated_and_logged_without_secrets(self):
         context = account_operation_source.set("admin")
         try:
-            outcome, browser = await self.personal_refresh(result="SECRET_NEW_ST")
+            outcome, browser = await self.personal_refresh(result={
+                "google_cookies": self.NEW_COOKIES, "email": "integrated@example.test"})
         finally:
             account_operation_source.reset(context)
-        self.assertEqual(outcome, "SECRET_NEW_ST")
-        browser.refresh_session_token.assert_awaited_once_with("isolated-personal-project")
+        self.assertTrue(outcome.startswith("frontend-"))
+        browser.refresh_google_cookies.assert_awaited_once_with(
+            "isolated-personal-project", token_id=self.token_id)
         token = await self.db.get_token(self.token_id)
-        self.assertEqual(token.st, "SECRET_NEW_ST")
-        self.assertEqual(token.at, "SECRET_AT")
-        self.assertFalse(self.manager._has_recent_at_validation(self.token_id))
+        self.assertEqual((token.st, token.at, token.google_cookies), (outcome, "SECRET_NEW_AT", self.NEW_COOKIES))
+        self.assertTrue(self.manager._has_recent_at_validation(
+            self.token_id, proxy_url=token.proxy_url, token=token))
         rows = await self.rows(operation="refresh_st")
         self.assertEqual(len(rows), 2)
         self.assertEqual({row["stage"] for row in rows}, {"ST_REFRESH"})
@@ -244,19 +251,20 @@ class AccountOperationIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]["details"], {"credential_changed": True})
         self.assertNotIn("SECRET", json.dumps(rows))
 
-    async def test_personal_session_failure_outcomes_preserve_credentials(self):
-        for result, error, reason in (
-            ("SECRET_ST", None, "session_token_unchanged"),
-            (None, None, "session_token_unavailable"),
-            (None, asyncio.TimeoutError(), "timeout"),
-            (None, RuntimeError("connection failed SECRET_COOKIE"), "network_or_proxy_unavailable"),
+    async def test_personal_cookie_failure_outcomes_preserve_credentials(self):
+        good = {"google_cookies": self.NEW_COOKIES, "email": "integrated@example.test"}
+        for result, error, validation, reason in (
+            (good, None, RuntimeError("code=401 SECRET_COOKIE"), "credentials_rejected"),
+            (None, asyncio.TimeoutError(), None, "network_or_proxy_unavailable"),
+            (None, RuntimeError("connection failed SECRET_COOKIE"), None, "network_or_proxy_unavailable"),
         ):
             with self.subTest(reason=reason):
                 self.manager._last_st_refresh_error.pop(self.token_id, None)
                 previous_count = len(await self.rows(operation="refresh_st"))
-                outcome, _ = await self.personal_refresh(result=result, error=error)
+                outcome, _ = await self.personal_refresh(result=result, error=error, validation=validation)
                 self.assertIsNone(outcome)
-                self.assertEqual((await self.db.get_token(self.token_id)).st, "SECRET_ST")
+                stored = await self.db.get_token(self.token_id)
+                self.assertEqual((stored.st, stored.google_cookies), ("SECRET_ST", "SID=SECRET_COOKIE"))
                 rows = await self.rows(operation="refresh_st")
                 self.assertEqual(len(rows), previous_count + 2)
                 self.assertEqual((rows[0]["status"], rows[0]["reason"]), ("failed", reason))
@@ -264,7 +272,7 @@ class AccountOperationIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_personal_cancellation_is_logged_and_propagated(self):
         entered = asyncio.Event()
-        async def wait_for_cancellation(_project):
+        async def wait_for_cancellation(*_args, **_kwargs):
             entered.set()
             await asyncio.Event().wait()
         task = asyncio.create_task(self.personal_refresh(error=wait_for_cancellation))
@@ -278,11 +286,10 @@ class AccountOperationIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]["reason"], "operation_cancelled")
         self.assertEqual((await self.db.get_token(self.token_id)).st, "SECRET_ST")
 
-    async def test_ineligible_personal_refresh_does_not_generate_skip_noise(self):
+    async def test_ineligible_refresh_does_not_generate_skip_noise(self):
         token = await self.db.get_token(self.token_id)
-        with patch("src.core.config.config", SimpleNamespace(captcha_method="browser")):
-            self.assertIsNone(await self.manager._try_refresh_st(self.token_id, token))
-        with patch("src.core.config.config", SimpleNamespace(captcha_method="personal")):
+        with patch("src.services.token_manager.config", SimpleNamespace(captcha_method="yescaptcha")), \
+             patch.object(self.manager, "_try_protocol_refresh_st", AsyncMock(return_value=None)):
             self.assertIsNone(await self.manager._try_refresh_st(self.token_id, token))
         self.assertEqual(await self.rows(), [])
 
@@ -332,9 +339,10 @@ class AccountOperationIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_due_protocol_refresh_has_source_and_no_repeat_skip_noise(self):
         await self.make_protocol_due()
         with patch("src.services.protocol_login.protocol_loginer.login", AsyncMock(return_value={
-            "success": True, "session_token": "SECRET_PROTOCOL_ST"})), \
-             patch.object(self.manager, "_st_to_at_for_token", AsyncMock(return_value={"access_token": "SECRET_PROTOCOL_AT"})), \
-             patch.object(self.manager, "_get_credits_for_token", AsyncMock(return_value={"credits": 90})):
+            "success": True, "google_cookies": "OSID=SECRET_NEW_OSID; SID=SECRET_NEW_SID",
+            "email": "integrated@example.test"})), \
+             patch.object(self.manager, "_st_to_at_for_token", AsyncMock(return_value={
+                 "access_token": "SECRET_PROTOCOL_AT", "credits": 90})):
             await self.manager.run_protocol_refresh_once()
             count = len(await self.rows())
             await self.manager.run_protocol_refresh_once()
