@@ -76,6 +76,26 @@ class GenerationCaptchaHealthTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(logged["submission_pending"], False)
                 handler.token_manager.record_error.assert_not_awaited()
 
+    async def test_native_submission_evidence_is_logged_and_returned_without_raw_browser_data(self):
+        failure = BrowserCaptchaError("native_submit", "timeout")
+        failure.submission_pending = False
+        failure.native_submission_diagnostic = {
+            "stage": "native_submit", "reason": "timeout", "error_kind": "timeout",
+            "armed": True, "request_admitted": False, "forwarding_started": False,
+            "request_forwarded": False, "page_closed": True, "submit_attempts": 2,
+            "elapsed_ms": 17000, "raw_error": "private-url?cookie=secret",
+            "cookie": "secret", "token_id": "secret",
+        }
+        handler, responses = await self.run_failure(failure)
+        error = json.loads(responses[-1])["error"]
+        diagnostic = error["native_submission_diagnostic"]
+        self.assertEqual(error["code"], "submission_not_started")
+        self.assertEqual(error["reason"], "timeout")
+        self.assertEqual(diagnostic["submit_attempts"], 2)
+        self.assertIs(diagnostic["forwarding_started"], False)
+        self.assertNotIn("secret", json.dumps(diagnostic))
+        self.assertEqual(handler._log_request.await_args.args[3]["native_submission_diagnostic"], diagnostic)
+
     async def test_routing_bookkeeping_failure_preserves_original_submission_evidence(self):
         failure = BrowserCaptchaError('native_generation_setup', 'mode_failed')
         failure.submission_pending = False

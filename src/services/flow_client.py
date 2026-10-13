@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, quote, urljoin, urlparse
 import urllib.error
 import urllib.request
 from curl_cffi.requests import AsyncSession
+from curl_cffi.const import CurlHttpVersion
 from ..core.logger import debug_logger
 from ..core.config import config, get_yescaptcha_min_score
 from .flow_current import CurrentFlowClientMixin
@@ -734,6 +735,8 @@ class _FlowClientBase(FlowFrontendMixin):
         return_error_response: bool = False,
         redact_sensitive_logs: bool = False,
         impersonate: str = "chrome",
+        http_version: Optional[int] = None,
+        allow_http1_fallback: bool = False,
     ) -> str:
         """执行原始文本请求（如 SSE），返回响应文本。"""
         fingerprint = self._request_fingerprint_ctx.get()
@@ -880,21 +883,17 @@ class _FlowClientBase(FlowFrontendMixin):
 
         try:
             async with AsyncSession(trust_env=False) as session:
+                request_kwargs = {
+                    "headers": headers,
+                    "proxy": proxy_url,
+                    "timeout": request_timeout,
+                    "impersonate": impersonate,
+                }
+                if http_version is not None:
+                    request_kwargs["http_version"] = http_version
                 if method.upper() == "GET":
-                    response = await session.get(
-                        url,
-                        headers=headers,
-                        proxy=proxy_url,
-                        timeout=request_timeout,
-                        impersonate=impersonate,
-                    )
+                    response = await session.get(url, **request_kwargs)
                 else:
-                    request_kwargs = {
-                        "headers": headers,
-                        "proxy": proxy_url,
-                        "timeout": request_timeout,
-                        "impersonate": impersonate,
-                    }
                     if raw_body is not None:
                         request_kwargs["data"] = raw_body
                     else:
@@ -903,7 +902,48 @@ class _FlowClientBase(FlowFrontendMixin):
                         if self._generation_request_was_sent():
                             raise RuntimeError("Generation POST already sent; replay disabled")
                         await self._notify_generation_sent()
-                    response = await session.post(url, **request_kwargs)
+                    try:
+                        response = await session.post(url, **request_kwargs)
+                    except Exception as transport_error:
+                        parsed_url = urlparse(url)
+                        # Only the read-only balance RPC can be replayed. A lost
+                        # response from a generation or mutation remains unknown.
+                        readonly_credits = (
+                            method.upper() == "POST"
+                            and parsed_url.hostname == "flow.google.com"
+                            and parsed_url.path == "/_/AiSandboxAngularFrontend/data/batchexecute"
+                            and parse_qs(parsed_url.query).get("rpcids") == ["nzlxg"]
+                        )
+                        connection_lost = (
+                            getattr(transport_error, "code", None) in {52, 56}
+                            or re.search(
+                                r"\bcurl:\s*\((?:52|56)\)",
+                                str(transport_error), re.IGNORECASE,
+                            )
+                        )
+                        response_status = getattr(
+                            getattr(transport_error, "response", None), "status_code", None,
+                        )
+                        http_error = (
+                            isinstance(response_status, int) and response_status >= 400
+                        )
+                        auth_error = re.search(
+                            r"\b(?:UNAUTHENTICATED|HTTP(?:\s+Error)?\s+401)\b",
+                            str(transport_error), re.IGNORECASE,
+                        )
+                        if not (
+                            allow_http1_fallback and readonly_credits
+                            and http_version is None and connection_lost
+                            and not http_error and not auth_error
+                        ):
+                            raise
+                        debug_logger.log_warning(
+                            "[FLOW CREDITS] Connection lost; retrying once with HTTP/1.1 on the same route"
+                        )
+                        # Keep the resolved route and complete request unchanged.
+                        # This second attempt is deliberately outside the retry catch.
+                        retry_kwargs = dict(request_kwargs, http_version=CurlHttpVersion.V1_1)
+                        response = await session.post(url, **retry_kwargs)
 
                 duration_ms = (time.time() - start_time) * 1000
                 response_text = response.text
@@ -956,11 +996,14 @@ class _FlowClientBase(FlowFrontendMixin):
             if "HTTP Error" not in error_msg and not any(
                 x in error_msg for x in ["PUBLIC_ERROR", "INVALID_ARGUMENT"]
             ):
-                debug_logger.log_error(f"[API FAILED] URL: {url}")
-                debug_logger.log_error(
-                    f"[API FAILED] Request Body: {request_body_for_log}"
-                )
-                debug_logger.log_error(f"[API FAILED] Exception: {error_msg}")
+                if redact_sensitive_logs:
+                    debug_logger.log_error("[API FAILED] Text request failed: <redacted>")
+                else:
+                    debug_logger.log_error(f"[API FAILED] URL: {url}")
+                    debug_logger.log_error(
+                        f"[API FAILED] Request Body: {request_body_for_log}"
+                    )
+                    debug_logger.log_error(f"[API FAILED] Exception: {error_msg}")
             raise Exception(f"Flow API text request failed: {error_msg}")
 
     def _should_fallback_to_urllib(self, error_message: str) -> bool:

@@ -210,6 +210,12 @@ class SubmissionLedger:
 
     async def observe(self, submission_id, handler):
         row = await self.get(submission_id)
+        if (row is not None and row['state'] in {'confirmed', 'failed'}
+                and row.get('account_id') is not None and row.get('operation_id')):
+            # Earlier versions could settle a receipt while leaving its local
+            # task or progress log active. Repair before every terminal return.
+            await self.db.reconcile_submission_terminal(
+                submission_id, account_id=row['account_id'], operation_id=row['operation_id'])
         if row is None or row['state'] in {'refused', 'failed'} or not row.get('operation_id'):
             return self.public(submission_id, row)
         if row['state'] == 'confirmed':
@@ -223,28 +229,50 @@ class SubmissionLedger:
         if token is None:
             return self.public(submission_id, row)
         try:
-            checked = await handler.flow_client.check_video_status(
-                token.at, row['operations'], token_id=token.id, google_cookies=token.google_cookies,
+            checked = await handler.token_manager._flow_call_for_token(
+                token,
+                lambda: handler.flow_client.check_video_status(
+                    token.at, row['operations'], token_id=token.id, google_cookies=token.google_cookies),
             )
-            operation = (checked.get('operations') or [{}])[0]
-            checked_id = operation.get('name') or (operation.get('operation') or {}).get('name')
-            if checked_id != row['operation_id']:
-                # Never attribute an unrelated media result to this client receipt.
+            matches = []
+            for candidate in checked.get('operations') or []:
+                if not isinstance(candidate, dict):
+                    continue
+                body = candidate.get('operation')
+                ids = {str(value) for value in (
+                    candidate.get('name'), body.get('name') if isinstance(body, dict) else None,
+                ) if value}
+                if row['operation_id'] in ids:
+                    if ids != {row['operation_id']}:
+                        return self.public(submission_id, row)
+                    matches.append(candidate)
+            if len(matches) != 1:
+                # Missing, conflicting, or duplicate identities are unresolved.
                 return self.public(submission_id, row)
+            operation = matches[0]
             status = str(operation.get('status') or '')
-            url = handler.flow_client._find_flow_content_url(checked, 'video')
+            url = handler.flow_client._find_flow_content_url(operation, 'video')
             if status == 'MEDIA_GENERATION_STATUS_SUCCESSFUL' and url:
-                await self.update(submission_id, state='confirmed', video_url=url, error=None)
-                await self.db.update_task(row['operation_id'], status='completed', progress=100, result_urls=[url],
-                                          error_message='', completed_at=time.time())
+                await self.db.reconcile_submission_terminal(
+                    submission_id, account_id=row['account_id'], operation_id=row['operation_id'],
+                    state='confirmed', video_url=url)
             elif status == 'MEDIA_GENERATION_STATUS_FAILED' or status.startswith('MEDIA_GENERATION_STATUS_ERROR'):
                 error = (operation.get('operation') or {}).get('error') or {}
-                await self.update(submission_id, state='failed', error={
-                    'code': 'video_generation_failed', 'message': error.get('message') or status,
-                    'submission_pending': False, 'upstream_accepted': True,
-                })
+                await self.db.reconcile_submission_terminal(
+                    submission_id, account_id=row['account_id'], operation_id=row['operation_id'],
+                    state='failed', error={
+                        'code': 'video_generation_failed', 'message': error.get('message') or status,
+                        'operation_id': row['operation_id'],
+                        'submission_pending': False, 'upstream_accepted': True,
+                    })
             else:
-                await self.update(submission_id, operations=checked.get('operations') or row['operations'])
+                # Preserve the originally submitted operation set. Extra lookup
+                # results must not become new identities in this paid receipt.
+                await self.update(submission_id, operations=[
+                    operation if isinstance(original, dict) and (
+                        original.get('name') or (original.get('operation') or {}).get('name')
+                    ) == row['operation_id'] else original for original in row['operations']
+                ])
         except Exception as exc:
             # Credential/network failure is an observation failure, never cancellation.
             reason = 'poll_auth_failed' if re.search(r'401|UNAUTHENTICATED', str(exc), re.I) else 'poll_failed'

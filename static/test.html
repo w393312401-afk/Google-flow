@@ -4,6 +4,11 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Flow2API 模型测试</title>
+<script>
+if (window.self !== window.top && new URLSearchParams(window.location.search).get('embedded') === '1') {
+  document.documentElement.classList.add('embedded');
+}
+</script>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f1117; color: #e1e1e6; min-height: 100vh; }
@@ -119,6 +124,42 @@ h1 { text-align: center; margin-bottom: 8px; font-size: 24px; color: #7c8aff; }
   .sidebar { width: 100%; }
   .config-bar { flex-wrap: wrap; }
 }
+
+/* Match the management console when this tool is shown inside its test tab. */
+html.embedded body { background: #fff; color: #171717; min-height: 0; }
+html.embedded .container { max-width: none; padding: 0; }
+html.embedded h1, html.embedded .subtitle { display: none; }
+html.embedded .config-bar,
+html.embedded .section-title,
+html.embedded .model-list,
+html.embedded .gen-panel,
+html.embedded .output-panel { background: #fff; border-color: #e3e3e3; }
+html.embedded .config-bar { background: #fafafa; }
+html.embedded .config-bar input,
+html.embedded .form-group textarea,
+html.embedded .output-log { background: #fafafa; color: #171717; border-color: #e3e3e3; }
+html.embedded .config-bar input { min-width: 0; }
+html.embedded .config-bar label,
+html.embedded .form-group label,
+html.embedded .config-note,
+html.embedded .gen-panel .model-info,
+html.embedded .image-upload-hint { color: #737373; }
+html.embedded .section-title { color: #171717; }
+html.embedded .section-title:hover,
+html.embedded .model-item:hover { background: #f5f5f5; }
+html.embedded .model-item { border-color: #f0f0f0; gap: 8px; }
+html.embedded .model-item > span:first-child { overflow-wrap: anywhere; min-width: 0; }
+html.embedded .model-tag { flex-shrink: 0; }
+html.embedded .model-item.active { background: #eef2ff; color: #4338ca; }
+html.embedded .tag-image { background: #dcfce7; color: #15803d; }
+html.embedded .tag-video { background: #ffedd5; color: #c2410c; }
+html.embedded .image-upload-area { border-color: #e3e3e3; }
+html.embedded .btn-generate { background: #171717; }
+html.embedded .btn-generate:hover { background: #333; }
+html.embedded .btn-generate:disabled { background: #a3a3a3; }
+@media (max-width: 768px) {
+  html.embedded .config-bar { display: grid; grid-template-columns: auto minmax(0, 1fr); }
+}
 </style>
 </head>
 <body>
@@ -127,9 +168,9 @@ h1 { text-align: center; margin-bottom: 8px; font-size: 24px; color: #7c8aff; }
   <p class="subtitle">选择模型，输入提示词，测试生成效果</p>
 
   <div class="config-bar">
-    <label>API Key:</label>
+    <label for="apiKey">API Key:</label>
     <input type="password" id="apiKey" placeholder="输入 API Key">
-    <label>地址:</label>
+    <label for="baseUrl">地址:</label>
     <input type="text" id="baseUrl" placeholder="http://localhost:8000" />
   </div>
   <p class="config-note">未填写 API Key 或模型列表加载失败时，会回退到内置候选模型；实际生成前仍需填写有效 API Key。</p>
@@ -142,7 +183,7 @@ h1 { text-align: center; margin-bottom: 8px; font-size: 24px; color: #7c8aff; }
         <div class="model-info" id="selectedModelInfo">从左侧列表选择一个模型开始测试</div>
 
         <div class="form-group">
-          <label>提示词 (Prompt)</label>
+          <label for="promptInput">提示词 (Prompt)</label>
           <textarea id="promptInput" placeholder="描述你想生成的内容...">一只可爱的橘猫趴在窗台上晒太阳，窗外是樱花盛开的春天</textarea>
         </div>
 
@@ -606,7 +647,7 @@ function renderResult(content) {
   // If no media found, show raw text
   if (resultDiv.children.length === 0 && content.trim()) {
     const pre = document.createElement("pre");
-    pre.style.cssText = "color:#aaa;font-size:13px;white-space:pre-wrap;word-break:break-all;";
+    pre.style.cssText = "color:inherit;font-size:13px;white-space:pre-wrap;word-break:break-all;";
     pre.textContent = content;
     resultDiv.appendChild(pre);
   }

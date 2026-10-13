@@ -1,8 +1,11 @@
-"""Submit one image through the original Flow page and its native request."""
+"""Submit one generation through the original Flow page and its native request."""
 
 import asyncio
 import json
+import os
 import re
+import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -16,6 +19,65 @@ _NATIVE_FLOW_ROUTE = re.compile(r"^https://flow\.google\.com/")
 _GENERATION_RPCS = frozenset(
     {"ogiZ0b", "YhhmEf", "MZZa6b", "nprQif", "eb1hJf", "fZytfe", "p0UkFb", "SPrCad"}
 )
+_SUBMISSION_DIAGNOSTIC_PATH = (
+    Path(__file__).resolve().parents[2] / "local" / "native-submission-diagnostics.jsonl"
+)
+
+
+def _browser_failure_kind(error: Exception) -> str:
+    """Inspect private browser text only to select a fixed, safe category."""
+    message = str(error).lower()
+    for needle, category in (
+        ("target page, context or browser has been closed", "browser_closed"),
+        ("target closed", "browser_closed"),
+        ("page has been closed", "browser_closed"),
+        ("not attached", "element_detached"),
+        ("element was detached", "element_detached"),
+        ("intercepts pointer events", "click_intercepted"),
+        ("not enabled", "submit_disabled"),
+        ("trusted", "trusted_types"),
+        ("content security policy", "content_security_policy"),
+    ):
+        if needle in message:
+            return category
+    # Playwright's TimeoutError is not the built-in/asyncio TimeoutError.
+    if (isinstance(error, (asyncio.TimeoutError, TimeoutError))
+            or type(error).__name__ == "TimeoutError" or "timeout" in message):
+        return "timeout"
+    return "browser_operation_failed"
+
+
+def _safe_error_kind(error: Exception) -> str:
+    name = type(error).__name__
+    return name if name in {
+        "TimeoutError", "Error", "TargetClosedError", "RuntimeError", "TypeError", "ValueError",
+        "BrowserCaptchaError",
+    } else "other"
+
+
+def _browser_failure(stage: str, reason: str, error: Exception) -> BrowserCaptchaError:
+    failure = BrowserCaptchaError(stage, reason)
+    failure.native_error_kind = _safe_error_kind(error)
+    failure.native_failure_kind = _browser_failure_kind(error)
+    return failure
+
+
+def _record_submission_diagnostic(diagnostic: dict) -> None:
+    """Persist only our fixed fields, with owner-only access and bounded history."""
+    try:
+        directory = _SUBMISSION_DIAGNOSTIC_PATH.parent
+        directory.mkdir(mode=0o700, exist_ok=True)
+        directory.chmod(0o700)
+        if _SUBMISSION_DIAGNOSTIC_PATH.exists() and _SUBMISSION_DIAGNOSTIC_PATH.stat().st_size > 256_000:
+            os.replace(_SUBMISSION_DIAGNOSTIC_PATH, _SUBMISSION_DIAGNOSTIC_PATH.with_suffix(".previous"))
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(_SUBMISSION_DIAGNOSTIC_PATH, flags, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8") as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(json.dumps({"time": time.time(), **diagnostic}, ensure_ascii=True) + "\n")
+    except OSError:
+        # Diagnostics cannot replace the original submission failure.
+        pass
 
 
 def _nonempty_string(value: Any) -> bool:
@@ -188,14 +250,14 @@ async def _prepare_submit_control(page):
     control = page.locator(_SUBMIT_CONTROL).first
     try:
         await control.wait_for(state="visible", timeout=8000)
-    except Exception:
-        raise BrowserCaptchaError("native_submit_prepare", "submit_control_missing") from None
+    except Exception as error:
+        raise _browser_failure("native_submit_prepare", "submit_control_missing", error) from None
     try:
         # A trial click waits for enabled state and overlay/layout stability but
         # never dispatches the click. Failure here is still proven unsubmitted.
         await control.click(trial=True, timeout=8000)
-    except Exception:
-        raise BrowserCaptchaError("native_submit_prepare", "submit_control_not_ready") from None
+    except Exception as error:
+        raise _browser_failure("native_submit_prepare", "submit_control_not_ready", error) from None
     return control
 
 
@@ -211,6 +273,12 @@ async def _submit_native_generation(
     stopping = False
     armed = False
     admitted = False
+    forwarding_started = False
+    request_forwarded = False
+    submit_attempts = 0
+    failure = None
+    click_warning = None
+    started_at = time.monotonic()
     selected_request = None
     session_id = None
     route_failure = None
@@ -220,11 +288,6 @@ async def _submit_native_generation(
         nonlocal stage
         stage = value
         browser._record_captcha_stage(value)
-
-    def annotate_submission(error):
-        if not armed:
-            error.submission_pending = False
-        return error
 
     def fail_route(reason, failure_stage="native_request_interception", payload_shape=None):
         nonlocal route_failure
@@ -248,7 +311,7 @@ async def _submit_native_generation(
                 pass
 
     async def native_route(route):
-        nonlocal admitted, selected_request, session_id, stopping
+        nonlocal admitted, selected_request, session_id, stopping, forwarding_started, request_forwarded
         request = route.request
         if request.method != "POST":
             await route.continue_()
@@ -283,10 +346,19 @@ async def _submit_native_generation(
         try:
             if on_generation_sent is not None:
                 await on_generation_sent()
+            # A click/deadline failure can close the owned page while the
+            # callback is awaiting bookkeeping. Never forward after that stop.
+            if stopping:
+                await abort(route)
+                return
+            # continue_ can send the request and then raise on a disconnect.
+            # Mark the uncertainty before awaiting it, never after success.
+            forwarding_started = True
             if body is None:
                 await route.continue_()
             else:
                 await route.continue_(post_data=body)
+            request_forwarded = True
         except Exception:
             await abort(route)
             fail_route("request_continue_failed")
@@ -294,7 +366,7 @@ async def _submit_native_generation(
         request_ready.set()
 
     async def run():
-        nonlocal page, armed
+        nonlocal page, armed, submit_attempts, click_warning
         set_stage("native_page_creation")
         page = await browser._new_page(context)
         await browser._apply_browser_environment_patch(page, label=f"native_{kind.lower()}_page")
@@ -351,11 +423,34 @@ async def _submit_native_generation(
             # Uploading must not change the submitted prompt.
             if await read_native_prompt(editor) != spec["prompt"]:
                 raise BrowserCaptchaError(stage, "prompt_changed_during_upload")
-        set_stage("native_submit_prepare")
-        submit_control = await _prepare_submit_control(page)
-        set_stage("native_submit")
-        armed = True
-        await submit_control.click(timeout=8000)
+        for submit_attempts in range(1, 3):
+            set_stage("native_submit_prepare")
+            submit_control = await _prepare_submit_control(page)
+            set_stage("native_submit")
+            armed = True
+            try:
+                await submit_control.click(timeout=8000, no_wait_after=True)
+                break
+            except Exception as error:
+                failure_kind = _browser_failure_kind(error)
+                if admitted:
+                    # Clicking can dispatch the generation and then fail while
+                    # the UI rerenders/navigates. Observe that original request
+                    # instead of losing its response or clicking a second time.
+                    click_warning = _browser_failure("native_submit", failure_kind, error)
+                    browser._record_captcha_stage("native_submit", failure_kind)
+                    break
+                # Reacquire and preflight once after an actionability race.
+                # The same gate still permits at most one generation request.
+                if (submit_attempts == 1 and not admitted and not forwarding_started
+                        and route_failure is None and failure_kind in {
+                            "timeout", "element_detached", "click_intercepted", "submit_disabled",
+                        }):
+                    armed = False
+                    browser._record_captcha_stage("native_submit", failure_kind)
+                    await browser._dismiss_flow_overlays(page)
+                    continue
+                raise _browser_failure("native_submit", failure_kind, error) from None
         set_stage("native_request_interception")
         await request_ready.wait()
         if route_failure:
@@ -378,22 +473,27 @@ async def _submit_native_generation(
     try:
         return await asyncio.wait_for(run(), timeout=max(0.001, float(timeout)))
     except BrowserCaptchaError as error:
-        annotate_submission(error)
+        failure = error
         raise
-    except (asyncio.TimeoutError, TimeoutError):
-        raise annotate_submission(BrowserCaptchaError(stage, "timeout")) from None
-    except Exception:
-        raise annotate_submission(BrowserCaptchaError(stage, "browser_operation_failed")) from None
+    except Exception as error:
+        failure = _browser_failure(stage, _browser_failure_kind(error), error)
+        raise failure from None
     finally:
         stopping = True
+        page_closed = page is None
         # Keep the rejecting route installed until the owned page is closed,
         # including during timeout/cancellation and response parsing failures.
         if page is not None:
             async def close_owned_page():
+                nonlocal page_closed
                 try:
                     await asyncio.wait_for(page.close(), timeout=3)
+                    page_closed = True
                 except Exception:
-                    pass
+                    try:
+                        page_closed = page.is_closed() is True
+                    except Exception:
+                        pass
 
             # A caller deadline can fire while the inner deadline is already
             # cleaning up. Do not cancel close or release the browser slot early.
@@ -404,5 +504,29 @@ async def _submit_native_generation(
                     await asyncio.shield(cleanup)
                 except asyncio.CancelledError:
                     cancelled = True
-            if cancelled:
-                raise asyncio.CancelledError
+        diagnostic_failure = failure or click_warning
+        if diagnostic_failure is not None:
+            # A button click is not acceptance evidence. Once cleanup has
+            # closed the guarded page, no continue_ started means no billable
+            # generation was sent. An uncertain close remains pending.
+            if failure is not None:
+                failure.submission_pending = False if not forwarding_started and page_closed else None
+            diagnostic = {
+                "stage": stage, "reason": diagnostic_failure.reason,
+                "error_kind": getattr(diagnostic_failure, "native_error_kind", "BrowserCaptchaError"),
+                "failure_kind": getattr(diagnostic_failure, "native_failure_kind", diagnostic_failure.reason),
+                "armed": armed, "request_admitted": admitted,
+                "forwarding_started": forwarding_started, "request_forwarded": request_forwarded,
+                "page_closed": page_closed, "submit_attempts": submit_attempts,
+                "elapsed_ms": round((time.monotonic() - started_at) * 1000),
+            }
+            token_id = getattr(browser, "token_id", None)
+            if type(token_id) is int:
+                diagnostic["token_id"] = token_id
+            if failure is not None:
+                failure.native_submission_diagnostic = diagnostic
+            else:
+                diagnostic["recovered"] = True
+            _record_submission_diagnostic(diagnostic)
+        if page is not None and cancelled:
+            raise asyncio.CancelledError

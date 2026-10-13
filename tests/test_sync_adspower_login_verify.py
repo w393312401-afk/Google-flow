@@ -43,6 +43,7 @@ class FakeSync:
         self.calls = []
         self.cookies_value = [{"name": "SID", "value": "COOKIE_SECRET"}]
         self.cookie_hash = "a" * 64
+        self.session_hash = "c" * 64
         self.proxy_hash = "b" * 64
         outer = self
         class Gateway:
@@ -65,6 +66,10 @@ class FakeSync:
     def validation_proxy_hash(self, proxy):
         self.calls.append(("proxy_hash", proxy))
         return self.proxy_hash
+
+    def auth_session_hash(self, cookies):
+        self.calls.append(("session_hash", cookies))
+        return self.session_hash
 
     async def validate_identity(self, cookies, expected_email, proxy):
         raise AssertionError("Only verified_session may call its validator")
@@ -89,11 +94,14 @@ class VerifyTests(unittest.IsolatedAsyncioTestCase):
         fake = FakeSync()
         result = await self.execute(fake)
         self.assertEqual(result, {"ok": True, "code": "login_verified", "credits": 840,
-            "verified_cookie_hash": "a" * 64, "verified_proxy_hash": "b" * 64})
+            "verified_cookie_hash": "a" * 64, "verified_session_hash": "c" * 64,
+            "verified_proxy_hash": "b" * 64})
         source = next(call[1] for call in fake.calls if call[0] == "cookies")
         self.assertEqual(source, {"source": "cdp", "ws": request()["ws_url"]})
         verification = next(call for call in fake.calls if call[0] == "verify")
         self.assertEqual(verification[3:], (request()["expected_email"], request()["proxy_url"]))
+        self.assertIs(next(call for call in fake.calls if call[0] == "session_hash")[1],
+                      verification[2])
         self.assertNotIn("SECRET", json.dumps(result))
         self.assertNotIn("ws_url", result)
 
@@ -141,7 +149,7 @@ class VerifyTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(raised.exception.code, code)
 
     async def test_invalid_hash_proof_is_rejected(self):
-        for field in ("cookie_hash", "proxy_hash"):
+        for field in ("cookie_hash", "session_hash", "proxy_hash"):
             fake = FakeSync()
             setattr(fake, field, "COOKIE_SECRET")
             with self.subTest(field=field):
@@ -225,7 +233,8 @@ class VerifyProtocolTests(unittest.TestCase):
         output = io.StringIO()
         async def successful(_):
             return {"ok": True, "code": "login_verified", "credits": 0,
-                    "verified_cookie_hash": "a" * 64, "verified_proxy_hash": "b" * 64}
+                    "verified_cookie_hash": "a" * 64, "verified_session_hash": "c" * 64,
+                    "verified_proxy_hash": "b" * 64}
         with patch.object(worker, "run_verification", successful):
             code = worker.main(io.StringIO(json.dumps(request())), output)
         self.assertEqual(code, 0)

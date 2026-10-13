@@ -16,7 +16,6 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 from curl_cffi.requests import AsyncSession
-from ..core.auth import AuthManager
 from ..core.database import Database
 from ..core.config import (
     config,
@@ -35,6 +34,9 @@ from ..core.monitoring import build_public_health_snapshot
 from ..services.token_manager import TokenManager
 from ..services.proxy_manager import ProxyManager
 from ..services.concurrency_manager import ConcurrencyManager
+from .account_operation_audit import audit_account_api
+from ..core.account_operation_context import operation_source
+from ..core.account_admission import AccountAdmissionBusy
 
 try:
     import httpx
@@ -51,9 +53,8 @@ concurrency_manager: Optional[ConcurrencyManager] = None
 captcha_runtime_prepare_tasks: Dict[str, asyncio.Task] = {}
 refresh_all_running = False
 
-# Store active admin session tokens (in production, use Redis or database)
-active_admin_tokens = set()
 ADMIN_SESSION_COOKIE_NAME = "admin_session"
+ADMIN_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60
 SUPPORTED_API_CAPTCHA_METHODS = {
     "yescaptcha",
     "captcharun",
@@ -830,7 +831,8 @@ class ImportTokensRequest(BaseModel):
 
 class TokenRefreshConfigRequest(BaseModel):
     enabled: Optional[bool] = None
-    refresh_interval_minutes: Optional[int] = None
+    refresh_interval_minutes: Optional[int] = Field(default=None, ge=1, le=525600)
+    apply_to_active_tokens: bool = Field(default=False, strict=True)
 
 
 class PluginTokenUpdateRequest(BaseModel):
@@ -862,10 +864,10 @@ async def verify_admin_token(request: Request, authorization: str = Header(None)
 
     cookie_token = get_admin_token_from_cookie(request) or ""
 
-    if header_token and header_token in active_admin_tokens:
+    if header_token and await is_admin_session_token_valid(header_token):
         return header_token
 
-    if cookie_token and cookie_token in active_admin_tokens:
+    if cookie_token and await is_admin_session_token_valid(cookie_token):
         return cookie_token
 
     if header_token or cookie_token:
@@ -879,35 +881,53 @@ def get_admin_token_from_cookie(request: Request) -> Optional[str]:
     return token or None
 
 
-def is_admin_session_token_valid(token: Optional[str]) -> bool:
+async def is_admin_session_token_valid(token: Optional[str]) -> bool:
     normalized = str(token or "").strip()
-    return bool(normalized) and normalized in active_admin_tokens
+    if not normalized or db is None:
+        return False
+    return await db.is_admin_session_valid(normalized)
+
+
+def _admin_credentials_match(admin_config, username: str, password: str) -> bool:
+    if admin_config is None:
+        return False
+    return (secrets.compare_digest(username.encode("utf-8"), admin_config.username.encode("utf-8"))
+            and secrets.compare_digest(password.encode("utf-8"), admin_config.password.encode("utf-8")))
 
 
 # ========== Auth Endpoints ==========
 
 
 @router.post("/api/admin/login")
-async def admin_login(request: LoginRequest, response: Response):
+async def admin_login(request: LoginRequest, response: Response, http_request: Request):
     """Admin login - returns session token (NOT API key)"""
     admin_config = await db.get_admin_config()
 
-    if not AuthManager.verify_admin(request.username, request.password):
+    if not _admin_credentials_match(admin_config, request.username, request.password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     # Generate independent session token
     session_token = f"admin-{secrets.token_urlsafe(32)}"
 
-    # Store in active tokens
-    active_admin_tokens.add(session_token)
+    try:
+        expires_at = await db.create_admin_session(
+            session_token, ADMIN_SESSION_TTL_SECONDS,
+            expected_credentials=(request.username, request.password),
+        )
+    except ValueError:
+        raise HTTPException(status_code=401, detail="登录信息发生变化，请重新登录") from None
+    except Exception:
+        raise HTTPException(status_code=503, detail="无法保存登录状态，请稍后重试") from None
 
     response.set_cookie(
         key=ADMIN_SESSION_COOKIE_NAME,
         value=session_token,
         httponly=True,
         samesite="lax",
-        secure=False,
+        secure=http_request.url.scheme == "https",
         path="/",
+        max_age=ADMIN_SESSION_TTL_SECONDS,
+        expires=expires_at,
     )
 
     return {
@@ -918,22 +938,24 @@ async def admin_login(request: LoginRequest, response: Response):
 
 
 @router.post("/api/admin/logout")
-async def admin_logout(response: Response, token: str = Depends(verify_admin_token)):
+async def admin_logout(request: Request, response: Response, token: str = Depends(verify_admin_token)):
     """Admin logout - invalidate session token"""
-    active_admin_tokens.discard(token)
+    presented = {token, get_admin_token_from_cookie(request)} - {None}
+    for session_token in presented:
+        await db.revoke_admin_session(session_token)
     response.delete_cookie(ADMIN_SESSION_COOKIE_NAME, path="/")
     return {"success": True, "message": "退出登录成功"}
 
 
 @router.post("/api/admin/change-password")
 async def change_password(
-    request: ChangePasswordRequest, token: str = Depends(verify_admin_token)
+    request: ChangePasswordRequest, response: Response, token: str = Depends(verify_admin_token)
 ):
     """Change admin password"""
     admin_config = await db.get_admin_config()
 
     # Verify old password
-    if not AuthManager.verify_admin(admin_config.username, request.old_password):
+    if not _admin_credentials_match(admin_config, admin_config.username, request.old_password):
         raise HTTPException(status_code=400, detail="旧密码错误")
 
     # Update password and username in database
@@ -946,8 +968,9 @@ async def change_password(
     # 🔥 Hot reload: sync database config to memory
     await db.reload_config_to_memory()
 
-    # 🔑 Invalidate all admin session tokens (force re-login for security)
-    active_admin_tokens.clear()
+    # update_admin_config revokes the old sessions in the same transaction as
+    # the credential change, without revoking later logins using the new password.
+    response.delete_cookie(ADMIN_SESSION_COOKIE_NAME, path="/")
 
     return {"success": True, "message": "密码修改成功,请重新登录"}
 
@@ -1054,6 +1077,7 @@ async def get_tokens(token: str = Depends(verify_admin_token)):
 
 
 @router.post("/api/tokens")
+@audit_account_api("create")
 async def add_token(request: AddTokenRequest, token: str = Depends(verify_admin_token)):
     """Add a new token"""
     try:
@@ -1109,9 +1133,29 @@ async def add_token(request: AddTokenRequest, token: str = Depends(verify_admin_
 
 
 @router.put("/api/tokens/{token_id}")
+@audit_account_api("update")
 async def update_token(
-    token_id: int, request: UpdateTokenRequest, token: str = Depends(verify_admin_token)
+    token_id: int, request: UpdateTokenRequest, token: str = Depends(verify_admin_token),
+    maintenance_capability: Optional[str] = Header(None, alias="X-Flow-Maintenance-Capability"),
 ):
+    admission = getattr(token_manager, "account_admission", None)
+    if admission is None:
+        return await _update_token_admitted(token_id, request, token)
+    try:
+        lease = (admission.worker(token_id, maintenance_capability)
+                 if isinstance(maintenance_capability, str)
+                 else admission.maintenance(token_id))
+        with lease:
+            return await _update_token_admitted(token_id, request, token)
+    except AccountAdmissionBusy as exc:
+        from ..services.credential_recovery import CredentialRecoveryError
+        error = CredentialRecoveryError(exc.reason)
+        raise HTTPException(status_code=409, detail={
+            "code": error.code, "reason": error.code, "message": error.message,
+        }) from None
+
+
+async def _update_token_admitted(token_id: int, request: UpdateTokenRequest, token: str):
     """Validate current Flow cookies and update an account."""
     try:
         existing = await token_manager.get_token(token_id)
@@ -1193,6 +1237,7 @@ async def update_token(
 
 
 @router.delete("/api/tokens/{token_id}")
+@audit_account_api("delete")
 async def delete_token(token_id: int, token: str = Depends(verify_admin_token)):
     """Delete token"""
     try:
@@ -1205,6 +1250,7 @@ async def delete_token(token_id: int, token: str = Depends(verify_admin_token)):
 
 
 @router.put("/api/tokens/{token_id}/adspower-serial")
+@audit_account_api("binding", setting="ads_serial")
 async def set_adspower_serial(
     token_id: int, request: AdsPowerSerialRequest, token: str = Depends(verify_admin_token)
 ):
@@ -1216,6 +1262,7 @@ async def set_adspower_serial(
 
 
 @router.post("/api/tokens/{token_id}/enable")
+@audit_account_api("enable")
 async def enable_token(token_id: int, token: str = Depends(verify_admin_token)):
     """Enable token"""
     await token_manager.enable_token(token_id)
@@ -1223,13 +1270,17 @@ async def enable_token(token_id: int, token: str = Depends(verify_admin_token)):
 
 
 @router.post("/api/tokens/{token_id}/disable")
+@audit_account_api("disable")
 async def disable_token(token_id: int, token: str = Depends(verify_admin_token)):
     """Disable token"""
-    await token_manager.disable_token(token_id)
+    await token_manager.disable_token(
+        token_id, reason="low_balance_disabled" if operation_source() == "cookie_sync" else "manual_disable",
+    )
     return {"success": True, "message": "Token已禁用"}
 
 
 @router.post("/api/tokens/{token_id}/refresh-credits")
+@audit_account_api("refresh_credits")
 async def refresh_credits(token_id: int, token: str = Depends(verify_admin_token)):
     """刷新Token余额 🆕
 
@@ -1246,7 +1297,23 @@ async def refresh_credits(token_id: int, token: str = Depends(verify_admin_token
         raise HTTPException(status_code=500, detail=_truncate_text(e))
 
 
+@router.post("/api/tokens/{token_id}/recover-credentials")
+@audit_account_api("refresh_at")
+async def recover_credentials(token_id: int, token: str = Depends(verify_admin_token)):
+    """Use the bound AdsPower environment to recover and verify real cookies."""
+    from ..services.credential_recovery import CredentialRecoveryError
+
+    try:
+        return await token_manager.recover_credentials(token_id)
+    except CredentialRecoveryError as error:
+        raise HTTPException(status_code=error.status_code, detail={
+            "success": False, "code": error.code, "reason": error.code,
+            "message": error.message,
+        }) from None
+
+
 @router.post("/api/tokens/{token_id}/refresh-at")
+@audit_account_api("refresh_at")
 async def refresh_at(token_id: int, token: str = Depends(verify_admin_token)):
     """手动刷新Token的AT (使用ST转换) 🆕
 
@@ -1282,6 +1349,12 @@ async def refresh_at(token_id: int, token: str = Depends(verify_admin_token)):
     )
 
 
+def _refresh_upstream_http_status(reason: str) -> Optional[str]:
+    """Read only the sanitized upstream HTTP category produced by TokenManager."""
+    match = re.search(r"\bupstream unavailable \(HTTP ([45]\d{2})\)", reason or "")
+    return match.group(1) if match else None
+
+
 def _translate_health_reason(reason: str, disabled: bool = False) -> str:
     """把失败原因类别翻译成可操作的提示，不暴露响应体或 Cookie。"""
     if "credentials rejected" in reason:
@@ -1292,6 +1365,8 @@ def _translate_health_reason(reason: str, disabled: bool = False) -> str:
         message = "网络或代理暂时不可用，请稍后再试或检查该账号的代理"
     elif "traffic restriction" in reason:
         message = "上游流量限制，请稍后再试"
+    elif upstream_status := _refresh_upstream_http_status(reason):
+        message = f"上游服务暂时不可用（HTTP {upstream_status}），请稍后再试"
     elif "account disabled" in reason:
         message = "账号已禁用，请先启用后再刷新"
     else:
@@ -1303,13 +1378,21 @@ def _describe_refresh_failure(reason: str, disabled: bool) -> str:
     return f"AT刷新失败: {_translate_health_reason(reason, disabled)}"
 
 
-# 代理/网络抖动属于瞬时失败，值得重试；认证失败、上游流量限制等不重试
+# 代理/网络抖动与网关临时不可用可以重试；认证失败、流量限制等不重试
 REFRESH_ALL_TRANSIENT_REASON = "network or proxy unavailable"
+REFRESH_ALL_TRANSIENT_HTTP_STATUSES = {"502", "503", "504"}
 refresh_all_retry_delays = (2.0, 5.0)
 
 
+def _is_retryable_refresh_failure(reason: str) -> bool:
+    return (
+        REFRESH_ALL_TRANSIENT_REASON in reason
+        or _refresh_upstream_http_status(reason) in REFRESH_ALL_TRANSIENT_HTTP_STATUSES
+    )
+
+
 async def _refresh_token_for_batch(item) -> Dict[str, Any]:
-    """刷新单个账号的 AT，瞬时网络失败时按 refresh_all_retry_delays 重试。"""
+    """刷新单个账号的 AT，瞬时网络或网关失败时进行有界重试。"""
     from ..core.logger import debug_logger
 
     entry: Dict[str, Any] = {"id": item.id, "email": item.email, "success": False}
@@ -1334,7 +1417,7 @@ async def _refresh_token_for_batch(item) -> Dict[str, Any]:
             return entry
         if (
             entry["disabled"]
-            or REFRESH_ALL_TRANSIENT_REASON not in reason
+            or not _is_retryable_refresh_failure(reason)
             or attempt >= len(refresh_all_retry_delays)
         ):
             return entry
@@ -1343,6 +1426,7 @@ async def _refresh_token_for_batch(item) -> Dict[str, Any]:
 
 
 @router.post("/api/tokens/refresh-all")
+@audit_account_api("batch_refresh")
 async def refresh_all_tokens(token: str = Depends(verify_admin_token)):
     """一键刷新所有已启用账号的 AT
 
@@ -1376,6 +1460,7 @@ async def refresh_all_tokens(token: str = Depends(verify_admin_token)):
 
 
 @router.post("/api/tokens/st2at")
+@audit_account_api("refresh_at")
 async def st_to_at(request: ST2ATRequest, token: str = Depends(verify_admin_token)):
     """Convert Session Token to Access Token (仅转换,不添加到数据库)"""
     try:
@@ -1395,6 +1480,7 @@ async def st_to_at(request: ST2ATRequest, token: str = Depends(verify_admin_toke
 
 
 @router.post("/api/tokens/import")
+@audit_account_api("import", source="import")
 async def import_tokens(
     request: ImportTokensRequest, token: str = Depends(verify_admin_token)
 ):
@@ -1473,9 +1559,9 @@ async def import_tokens(
                     )
                     should_enable = item.is_active and not is_expired
                     if should_enable:
-                        await token_manager.enable_token(existing.id)
+                        await token_manager.enable_token(existing.id, reason="imported_enabled")
                     else:
-                        await token_manager.disable_token(existing.id)
+                        await token_manager.disable_token(existing.id, reason="imported_expired" if is_expired else "imported_disabled")
                     if concurrency_manager:
                         await concurrency_manager.reset_token(
                             existing.id,
@@ -1513,7 +1599,7 @@ async def import_tokens(
                     )
                     should_enable = item.is_active and not is_expired
                     if not should_enable:
-                        await token_manager.disable_token(new_token.id)
+                        await token_manager.disable_token(new_token.id, reason="imported_expired" if is_expired else "imported_disabled")
                         new_token.is_active = False
                     if concurrency_manager:
                         await concurrency_manager.reset_token(
@@ -1571,6 +1657,7 @@ async def get_proxy_config_alias(token: str = Depends(verify_admin_token)):
 
 
 @router.post("/api/proxy/config")
+@audit_account_api("config_update", setting="proxy")
 async def update_proxy_config_alias(
     request: ProxyConfigRequest, token: str = Depends(verify_admin_token)
 ):
@@ -1588,6 +1675,7 @@ async def update_proxy_config_alias(
 
 
 @router.post("/api/config/proxy")
+@audit_account_api("config_update", setting="proxy")
 async def update_proxy_config(
     request: ProxyConfigRequest, token: str = Depends(verify_admin_token)
 ):
@@ -1605,6 +1693,7 @@ async def update_proxy_config(
 
 
 @router.post("/api/proxy/test")
+@audit_account_api("health_check", setting="proxy")
 async def test_proxy_connectivity(
     request: ProxyTestRequest, token: str = Depends(verify_admin_token)
 ):
@@ -1675,6 +1764,7 @@ async def get_generation_config(token: str = Depends(verify_admin_token)):
 
 
 @router.post("/api/config/generation")
+@audit_account_api("config_update", setting="generation")
 async def update_generation_config(
     request: GenerationConfigRequest, token: str = Depends(verify_admin_token)
 ):
@@ -1712,6 +1802,7 @@ async def get_call_logic_config(token: str = Depends(verify_admin_token)):
 
 
 @router.post("/api/call-logic/config")
+@audit_account_api("config_update", setting="call_logic")
 async def update_call_logic_config(
     request: CallLogicConfigRequest, token: str = Depends(verify_admin_token)
 ):
@@ -1758,15 +1849,15 @@ async def get_system_info(token: str = Depends(verify_admin_token)):
 
 
 @router.post("/api/login")
-async def login(request: LoginRequest, response: Response):
+async def login(request: LoginRequest, response: Response, http_request: Request):
     """Login endpoint (alias for /api/admin/login)"""
-    return await admin_login(request, response)
+    return await admin_login(request, response, http_request)
 
 
 @router.post("/api/logout")
-async def logout(response: Response, token: str = Depends(verify_admin_token)):
+async def logout(request: Request, response: Response, token: str = Depends(verify_admin_token)):
     """Logout endpoint (alias for /api/admin/logout)"""
-    return await admin_logout(response, token)
+    return await admin_logout(request, response, token)
 
 
 @router.get("/health")
@@ -1873,6 +1964,7 @@ async def get_admin_config(token: str = Depends(verify_admin_token)):
 
 
 @router.post("/api/admin/config")
+@audit_account_api("config_update", setting="error_threshold")
 async def update_admin_config(
     request: UpdateAdminConfigRequest, token: str = Depends(verify_admin_token)
 ):
@@ -1885,10 +1977,10 @@ async def update_admin_config(
 
 @router.post("/api/admin/password")
 async def update_admin_password(
-    request: ChangePasswordRequest, token: str = Depends(verify_admin_token)
+    request: ChangePasswordRequest, response: Response, token: str = Depends(verify_admin_token)
 ):
     """Update admin password"""
-    return await change_password(request, token)
+    return await change_password(request, response, token)
 
 
 @router.post("/api/admin/apikey")
@@ -1934,6 +2026,7 @@ async def get_generation_timeout(token: str = Depends(verify_admin_token)):
 
 
 @router.post("/api/generation/timeout")
+@audit_account_api("config_update", setting="generation")
 async def update_generation_timeout(
     request: GenerationConfigRequest, token: str = Depends(verify_admin_token)
 ):
@@ -1968,6 +2061,7 @@ async def get_token_refresh_config(token: str = Depends(verify_admin_token)):
 
 
 @router.post("/api/token-refresh/enabled")
+@audit_account_api("config_update", setting="token_refresh")
 async def update_token_refresh_enabled(
     request: Optional[dict] = None, token: str = Depends(verify_admin_token)
 ):
@@ -1979,12 +2073,14 @@ async def update_token_refresh_enabled(
 
 
 @router.post("/api/token-refresh/config")
+@audit_account_api("config_update", setting="token_refresh")
 async def update_token_refresh_config(
     request: TokenRefreshConfigRequest, token: str = Depends(verify_admin_token)
 ):
     refresh_config = await db.update_token_refresh_config(
         enabled=request.enabled,
         refresh_interval_minutes=request.refresh_interval_minutes,
+        apply_to_active_tokens=request.apply_to_active_tokens,
     )
     return {
         "success": True,
@@ -2086,6 +2182,7 @@ async def update_cache_base_url(
 
 
 @router.post("/api/captcha/config")
+@audit_account_api("config_update", setting="captcha")
 async def update_captcha_config(
     request: dict, token: str = Depends(verify_admin_token)
 ):
@@ -2724,6 +2821,7 @@ async def get_plugin_config(request: Request, token: str = Depends(verify_admin_
 
 
 @router.post("/api/plugin/config")
+@audit_account_api("config_update", setting="plugin")
 async def update_plugin_config(request: dict, token: str = Depends(verify_admin_token)):
     """Update plugin configuration"""
     connection_token = request.get("connection_token", "")
@@ -2746,6 +2844,7 @@ async def update_plugin_config(request: dict, token: str = Depends(verify_admin_
 
 
 @router.post("/api/plugin/update-token")
+@audit_account_api("update", source="plugin")
 async def plugin_update_token(
     request: PluginTokenUpdateRequest,
     authorization: Optional[str] = Header(None),
@@ -2799,7 +2898,7 @@ async def plugin_update_token(
 
             # Check if auto-enable is enabled and token is disabled
             if plugin_config.auto_enable_on_update and not existing_token.is_active:
-                await token_manager.enable_token(existing_token.id)
+                await token_manager.enable_token(existing_token.id, reason="credentials_updated")
                 return {
                     "success": True,
                     "message": f"Token updated and auto-enabled for {email}",

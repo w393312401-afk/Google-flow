@@ -3,13 +3,17 @@
 import asyncio
 import copy
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import parse_qs, urlencode
 
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
 from src.services.captcha_errors import BrowserCaptchaError
-from src.services.native_image_submission import submit_native_image
+from src.services.native_image_submission import _record_submission_diagnostic, submit_native_image
 
 
 FLOW_ROUTE = "https://flow.google.com/**"
@@ -71,12 +75,14 @@ class FakeLocator:
                 raise TimeoutError("submit disabled or overlay blocks it")
             return
         self.page.events.append("click")
+        self.page.click_options.append(kwargs)
         await self.page.on_submit()
 
 
 class FakePage:
     def __init__(self):
         self.events = []
+        self.click_options = []
         self.handlers = []
         self.text = ""
         self.on_submit = AsyncMock()
@@ -115,6 +121,9 @@ class NativeImageSubmissionTests(unittest.IsolatedAsyncioTestCase):
         self.configure_generation = self.enterContext(patch(
             "src.services.native_image_submission._configure_generation", new_callable=AsyncMock
         ))
+        self.record_diagnostic = self.enterContext(patch(
+            "src.services.native_image_submission._record_submission_diagnostic"
+        ))
         self.page = FakePage()
         self.context = SimpleNamespace(new_page=AsyncMock(return_value=self.page))
         self.harvest_handler = AsyncMock()
@@ -146,8 +155,34 @@ class NativeImageSubmissionTests(unittest.IsolatedAsyncioTestCase):
             await self.page.dispatch(route)
         self.page.on_submit = AsyncMock(side_effect=dispatch)
 
-    async def submit(self, timeout=1):
-        return await submit_native_image(self.browser, self.context, "project", self.spec, timeout)
+    async def submit(self, timeout=1, **kwargs):
+        return await submit_native_image(self.browser, self.context, "project", self.spec, timeout, **kwargs)
+
+    async def wait_for_event_or_submission(self, event, task, timeout=0.5):
+        """Report an early submit failure instead of hanging on its never-set event."""
+        waiter = asyncio.create_task(event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {waiter, task}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED,
+            )
+            if task in done:
+                await task
+            if waiter not in done:
+                self.fail("submission did not reach the expected event before the test deadline")
+        finally:
+            waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+
+    async def test_async_event_wait_reports_early_submission_error(self):
+        error = BrowserCaptchaError("native_page_creation", "browser_operation_failed")
+
+        async def failed_submission():
+            raise error
+
+        task = asyncio.create_task(failed_submission())
+        with self.assertRaises(BrowserCaptchaError) as raised:
+            await self.wait_for_event_or_submission(asyncio.Event(), task)
+        self.assertIs(raised.exception, error)
 
     async def test_submission_creates_page_through_browser_factory(self):
         native = make_route()
@@ -234,6 +269,136 @@ class NativeImageSubmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(self.page.events.index("submit_trial"), self.page.events.index("click"))
         self.assertEqual(self.page.events.count("click"), 1)
         native.continue_.assert_awaited_once()
+        self.assertIs(self.page.click_options[0]["no_wait_after"], True)
+
+    async def test_click_timeout_after_forwarding_observes_original_request_without_reclick(self):
+        native = make_route()
+
+        async def dispatch_then_timeout():
+            await self.page.dispatch(native)
+            raise PlaywrightTimeoutError("Locator.click: Timeout 8000ms exceeded; private URL and cookie")
+
+        self.page.on_submit = AsyncMock(side_effect=dispatch_then_timeout)
+        result = await self.submit()
+        self.assertEqual(result["response_text"], "native-response")
+        self.assertEqual(self.page.events.count("click"), 1)
+        native.continue_.assert_awaited_once()
+        native.request.response.assert_awaited_once()
+        diagnostic = self.record_diagnostic.call_args.args[0]
+        self.assertTrue(diagnostic["recovered"])
+        self.assertTrue(diagnostic["forwarding_started"])
+        self.assertTrue(diagnostic["request_forwarded"])
+        self.assertEqual(diagnostic["failure_kind"], "timeout")
+        self.assertNotIn("private", json.dumps(diagnostic))
+
+    async def test_click_timeout_without_admission_reacquires_control_once(self):
+        native = make_route()
+        attempts = 0
+
+        async def submit_once_ready():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise PlaywrightTimeoutError("Locator.click: Timeout 8000ms exceeded")
+            await self.page.dispatch(native)
+
+        self.page.on_submit = AsyncMock(side_effect=submit_once_ready)
+        await self.submit()
+        self.assertEqual(self.page.events.count("submit_trial"), 2)
+        self.assertEqual(self.page.events.count("click"), 2)
+        self.assertEqual(self.browser._dismiss_flow_overlays.await_count, 2)
+        native.continue_.assert_awaited_once()
+
+    async def test_exhausted_click_timeout_is_unsubmitted_only_after_page_close(self):
+        self.page.on_submit.side_effect = PlaywrightTimeoutError("Locator.click: Timeout with secret-cookie")
+        with self.assertRaises(BrowserCaptchaError) as raised:
+            await self.submit()
+        self.assertEqual(raised.exception.reason, "timeout")
+        self.assertIs(raised.exception.submission_pending, False)
+        diagnostic = raised.exception.native_submission_diagnostic
+        self.assertEqual(diagnostic["error_kind"], "TimeoutError")
+        self.assertEqual(diagnostic["submit_attempts"], 2)
+        self.assertFalse(diagnostic["forwarding_started"])
+        self.assertTrue(diagnostic["page_closed"])
+        self.assertNotIn("secret", str(raised.exception))
+        self.assertNotIn("secret", json.dumps(diagnostic))
+
+    async def test_click_failure_with_uncertain_page_close_remains_pending(self):
+        self.page.on_submit.side_effect = RuntimeError("private browser failure")
+        self.page.close.side_effect = RuntimeError("close failed")
+        with self.assertRaises(BrowserCaptchaError) as raised:
+            await self.submit()
+        self.assertIsNone(raised.exception.submission_pending)
+        self.assertFalse(raised.exception.native_submission_diagnostic["page_closed"])
+        self.assertEqual(self.page.events.count("click"), 1)
+
+    async def test_late_generation_during_failed_click_cleanup_never_forwards(self):
+        late = make_route()
+        self.page.on_submit.side_effect = RuntimeError("private browser failure")
+        self.page.on_close = lambda: self.page.dispatch(late)
+        with self.assertRaises(BrowserCaptchaError) as raised:
+            await self.submit()
+        late.abort.assert_awaited_once()
+        late.continue_.assert_not_awaited()
+        self.assertIs(raised.exception.submission_pending, False)
+
+    async def test_async_bookkeeping_cannot_forward_after_timeout_cleanup(self):
+        native = make_route()
+        admitted = asyncio.Event()
+        release_bookkeeping = asyncio.Event()
+        routes = []
+
+        async def bookkeeping():
+            admitted.set()
+            await release_bookkeeping.wait()
+
+        async def dispatch_in_background():
+            routes.append(asyncio.create_task(self.page.dispatch(native)))
+            await admitted.wait()
+            raise PlaywrightTimeoutError("Locator.click: Timeout exceeded")
+
+        self.page.on_submit = AsyncMock(side_effect=dispatch_in_background)
+        with self.assertRaises(BrowserCaptchaError) as raised:
+            await self.submit(timeout=0.05, on_generation_sent=bookkeeping)
+        self.assertTrue(self.page.closed)
+        self.assertTrue(raised.exception.native_submission_diagnostic["request_admitted"])
+        self.assertFalse(raised.exception.native_submission_diagnostic["forwarding_started"])
+        self.assertIs(raised.exception.submission_pending, False)
+        release_bookkeeping.set()
+        await asyncio.gather(*routes)
+        native.continue_.assert_not_awaited()
+        native.abort.assert_awaited_once()
+        self.assertEqual(self.page.events.count("click"), 1)
+
+    async def test_cancelled_async_bookkeeping_cannot_forward_after_cleanup(self):
+        native = make_route()
+        admitted = asyncio.Event()
+        release_bookkeeping = asyncio.Event()
+        routes = []
+
+        async def bookkeeping():
+            admitted.set()
+            await release_bookkeeping.wait()
+
+        async def dispatch_in_background():
+            routes.append(asyncio.create_task(self.page.dispatch(native)))
+            await admitted.wait()
+
+        self.page.on_submit = AsyncMock(side_effect=dispatch_in_background)
+        task = asyncio.create_task(self.submit(on_generation_sent=bookkeeping))
+        try:
+            await self.wait_for_event_or_submission(admitted, task)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertTrue(self.page.closed)
+        finally:
+            release_bookkeeping.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, *routes, return_exceptions=True)
+        native.continue_.assert_not_awaited()
+        native.abort.assert_awaited_once()
 
     async def test_after_click_response_failure_does_not_claim_non_submission(self):
         native = make_route()
@@ -402,6 +567,9 @@ class NativeImageSubmissionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BrowserCaptchaError) as raised:
             await self.submit()
         self.assertEqual(raised.exception.reason, "request_continue_failed")
+        self.assertIsNone(raised.exception.submission_pending)
+        self.assertTrue(raised.exception.native_submission_diagnostic["forwarding_started"])
+        self.assertFalse(raised.exception.native_submission_diagnostic["request_forwarded"])
         self.assertNotIn("secret", str(raised.exception))
         native.abort.assert_awaited_once()
         native.request.response.assert_not_awaited()
@@ -471,6 +639,19 @@ class NativeImageSubmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private", str(raised.exception))
         self.assertTrue(self.page.closed)
         self.page.on_submit.assert_not_awaited()
+
+
+class NativeSubmissionDiagnosticTests(unittest.TestCase):
+    def test_machine_diagnostic_is_saved_with_private_permissions(self):
+        diagnostic = {"stage": "native_submit", "reason": "timeout", "forwarding_started": False}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "native-submission-diagnostics.jsonl"
+            with patch("src.services.native_image_submission._SUBMISSION_DIAGNOSTIC_PATH", path):
+                _record_submission_diagnostic(diagnostic)
+            saved = json.loads(path.read_text())
+            self.assertEqual({k: saved[k] for k in diagnostic}, diagnostic)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
 
 
 if __name__ == "__main__":

@@ -299,6 +299,155 @@ async def check_network_failure_saves_five_minute_backoff_without_secrets(tmp_pa
 _CASE = unittest.TestCase()
 
 
+class SparkBusyTests(unittest.TestCase):
+    def tasks(self, *tasks):
+        return {'tasks': list(tasks), 'total_count': len(tasks)}
+
+    def board(self, *, leases=(), waiting=()):
+        return {'status': 'ok', 'board': {'leases': list(leases), 'waiting': list(waiting)}}
+
+    def test_empty_browser_board_allows_active_frames_and_flow2api_orchestration(self):
+        for status in sync.ACTIVE:
+            with self.subTest(status=status):
+                tasks = self.tasks(
+                    {'id': 'frames', 'status': status,
+                     'dimensions': {'type': 'frames', 'userId': 'fixed-profile'}},
+                    {'id': 'videos', 'status': status,
+                     'dimensions': {'type': 'videos', 'video_provider': 'flow2api'}},
+                    {'id': 'video-chain', 'status': status,
+                     'dimensions': {'type': 'video_chain', 'video_provider': 'flow2api',
+                                    'video_fixed_user_id': 'fixed-profile'}})
+                self.assertFalse(sync.spark_busy(tasks, 'fixed-profile', board=self.board()))
+                # Callers without a browser inventory must retain the old guard.
+                self.assertTrue(sync.spark_busy(tasks, 'fixed-profile'))
+
+    def test_other_live_browser_lease_or_waiter_still_blocks(self):
+        tasks = self.tasks({'id': 'cancelled', 'status': 'cancelled'})
+        for board in (
+                self.board(leases=[{'task_id': 'cancelled', 'user_id': 'fixed-profile'}]),
+                self.board(leases=[{'task_id': 'other', 'user_id': 'other-profile'}]),
+                self.board(waiting=[{'task_id': 'next', 'user_id': 'fixed-profile'}]),
+                self.board(waiting=[{'task_id': 'other', 'user_id': 'other-profile'}])):
+            with self.subTest(board=board):
+                self.assertTrue(sync.spark_busy(tasks, 'fixed-profile', board=board))
+
+    def test_active_cookie_login_blocks_even_before_a_browser_lease_is_reported(self):
+        for marker in ({'maintenance': 'cookie_login'}, {'_cookie_login': True},
+                       {'id': 'cookie_login_other'}, {'task_id': 'cookie_login_other'},
+                       {'dimensions': {'type': 'auto_login'}}):
+            for status in sync.ACTIVE:
+                with self.subTest(marker=marker, status=status):
+                    task = dict({'id': 'other', 'status': status, 'profile_id': 'other-profile'}, **marker)
+                    self.assertTrue(sync.spark_busy(self.tasks(task), 'fixed-profile', board=self.board()))
+
+    def test_finished_cookie_login_does_not_block_an_empty_browser_board(self):
+        for status in sync.TERMINAL:
+            with self.subTest(status=status):
+                task = {'id': 'cookie_login_finished', 'status': status,
+                        'maintenance': 'cookie_login', 'profile_id': 'fixed-profile'}
+                self.assertFalse(sync.spark_busy(self.tasks(task), 'fixed-profile', board=self.board()))
+
+    def test_entire_task_inventory_is_validated_before_a_busy_result(self):
+        first_tasks = (
+            {'status': 'running', 'dimensions': {'userId': 'fixed-profile'}},
+            {'id': 'cookie_login_other', 'status': 'running'},
+        )
+        for first in first_tasks:
+            for board in (None, self.board(), self.board(leases=[{'task_id': 'other'}])):
+                with self.subTest(first=first, board=board):
+                    tasks = self.tasks(first, {'status': 'new_unknown_status'})
+                    with self.assertRaisesRegex(sync.SyncError, 'spark_task_state_unknown'):
+                        sync.spark_busy(tasks, 'fixed-profile', board=board)
+        with self.assertRaisesRegex(sync.SyncError, 'spark_inventory_incomplete'):
+            sync.spark_busy({'tasks': [], 'total_count': 1}, 'fixed-profile', board=self.board())
+
+    def test_invalid_browser_inventory_is_rejected_even_with_a_busy_login_task(self):
+        task = {'id': 'cookie_login_other', 'status': 'running'}
+        for board in ({}, {'status': 'error', 'board': {'leases': [], 'waiting': []}},
+                      {'status': 'ok', 'board': {'leases': []}},
+                      {'status': 'ok', 'board': {'leases': [], 'waiting': None}}):
+            with self.subTest(board=board), self.assertRaisesRegex(sync.SyncError, 'spark_lease_inventory_invalid'):
+                sync.spark_busy(self.tasks(task), 'fixed-profile', board=board)
+
+
+class GatewayBusyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cookie_write_delegates_maintenance_in_a_header_without_changing_the_account_payload(self):
+        gateway = sync.Gateway(config(), None, {})
+        gateway.authorization = {'Authorization': 'Bearer SYNTHETIC_ADMIN'}
+        gateway.maintenance_capability = 'c' * 64
+        gateway.request = AsyncMock(return_value={'success': True})
+        payload = {'auto_enable_on_update': False, 'google_cookies': 'SYNTHETIC_COOKIES'}
+        await gateway.write(2, payload)
+        request = gateway.request.await_args
+        self.assertEqual(request.args[0], 'PUT')
+        self.assertEqual(request.kwargs['body'], payload)
+        self.assertEqual(request.kwargs['headers'], {
+            'Authorization': 'Bearer SYNTHETIC_ADMIN', 'X-Flow-Maintenance-Capability': 'c' * 64})
+
+    async def test_malformed_maintenance_capability_never_reaches_account_write(self):
+        gateway = sync.Gateway(config(), None, {})
+        gateway.maintenance_capability = 'PRIVATE'
+        gateway.request = AsyncMock(return_value={'success': True})
+        with self.assertRaisesRegex(sync.SyncError, 'busy_state_unknown'):
+            await gateway.write(2, {'auto_enable_on_update': False})
+        gateway.request.assert_not_awaited()
+
+    async def busy(self, directory, *, tasks, board, active_token=None):
+        root = Path(directory)
+        path = root / 'flow.db'
+        with sqlite3.connect(path) as db:
+            db.execute('CREATE TABLE tasks(token_id INTEGER,status TEXT)')
+            db.execute('CREATE TABLE request_logs(token_id INTEGER,status_code INTEGER,status_text TEXT)')
+            if active_token is not None:
+                db.execute('INSERT INTO tasks VALUES(?,?)', (active_token, 'processing'))
+                db.execute('INSERT INTO request_logs VALUES(?,?,?)', (active_token, 102, 'video_polling'))
+        before = path.read_bytes()
+        spark_config = root / 'spark.json'
+        sync.save_private(spark_config, {})
+        conf = config(spark_config_path=str(spark_config), flow_db_path=str(path))
+        seen = []
+
+        def transport(request):
+            seen.append(request)
+            if request.url.path == '/api/tasks':
+                self.assertEqual(request.url.params.get('limit'), '0')
+                return httpx.Response(200, json=tasks)
+            if request.url.path == '/api/google-fx/board':
+                return httpx.Response(200, json=board)
+            raise AssertionError('Unexpected offline request route')
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+            gateway = sync.Gateway(conf, client, {})
+            result = await gateway.busy(2)
+        self.assertEqual([request.url.path for request in seen], ['/api/tasks', '/api/google-fx/board'])
+        self.assertTrue(all(request.headers.get('authorization') is None for request in seen))
+        self.assertEqual(path.read_bytes(), before)
+        return result
+
+    async def test_empty_board_and_another_flow_account_allow_target_cookie_recovery(self):
+        tasks = {'tasks': [
+            {'id': 'frames', 'status': 'running', 'dimensions': {'type': 'frames', 'userId': 'fixed-profile'}},
+            {'id': 'video', 'status': 'running', 'dimensions': {'type': 'videos', 'video_provider': 'flow2api'}},
+        ], 'total_count': 2}
+        board = {'status': 'ok', 'board': {'leases': [], 'waiting': []}}
+        for active_token, expected in ((None, (False, False)), (3, (False, False)), (2, (False, True))):
+            with self.subTest(active_token=active_token), tempfile.TemporaryDirectory() as directory:
+                self.assertEqual(await self.busy(directory, tasks=tasks, board=board, active_token=active_token), expected)
+
+    async def test_cookie_login_and_browser_board_each_block_with_an_idle_target_flow_account(self):
+        empty = {'status': 'ok', 'board': {'leases': [], 'waiting': []}}
+        cases = (
+            ({'tasks': [{'id': 'cookie_login_other', 'status': 'queued'}], 'total_count': 1}, empty),
+            ({'tasks': [], 'total_count': 0},
+             {'status': 'ok', 'board': {'leases': [{'task_id': 'other'}], 'waiting': []}}),
+            ({'tasks': [], 'total_count': 0},
+             {'status': 'ok', 'board': {'leases': [], 'waiting': [{'task_id': 'other'}]}}),
+        )
+        for tasks, board in cases:
+            with self.subTest(tasks=tasks, board=board), tempfile.TemporaryDirectory() as directory:
+                self.assertEqual(await self.busy(directory, tasks=tasks, board=board), (True, False))
+
+
 class SyncCookieTests(unittest.IsolatedAsyncioTestCase):
     async def test_same_cookie_renews_expired_unknown_and_soon_expiring_credentials_only(self):
         for old_expiry in (None, '', 'invalid', 1300, expiry(999), expiry(1200), expiry(1300),

@@ -19,6 +19,7 @@ from urllib.parse import quote, unquote, urlsplit
 from curl_cffi.requests import AsyncSession
 
 from .captcha_errors import BrowserCaptchaError
+from ..core.account_audit import audit_account_operation
 
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -250,6 +251,11 @@ class ExitRotationManager:
             record = dict(self._record(self._state(), token_id))
         if not record["due"] and record["count"] < policy["threshold"]:
             return token
+        await audit_account_operation(
+            self.db, token_id, operation="exit_rotation", status="started", reason="rotation_due",
+            stage="rotation", source="exit_rotation", token=token,
+            details={"count": record["count"], "threshold": policy["threshold"]},
+        )
         async with self._pool_lock:
             try:
                 candidates = self._pool(policy)
@@ -338,8 +344,17 @@ class ExitRotationManager:
                     raise
                 _LOGGER.warning("[EXIT_ROTATION] account=%s proxy_id=%s exit_ip=%s rotated",
                                 token_id, proxy_id, exit_ip)
+                await audit_account_operation(
+                    self.db, token_id, operation="exit_rotation", status="success", reason="rotation_complete",
+                    stage="rotation", source="exit_rotation", token=token,
+                    details={"count": checked, "proxy_changed": True},
+                )
                 return await self.db.get_token(token_id) or token
             except asyncio.CancelledError:
+                await audit_account_operation(
+                    self.db, token_id, operation="exit_rotation", status="failed", reason="operation_cancelled",
+                    stage="rotation", source="exit_rotation", token=token,
+                )
                 raise
             except Exception:
                 async with self._state_lock:
@@ -347,6 +362,11 @@ class ExitRotationManager:
                     self._record(state, token_id).update(due=True, error="unavailable")
                     self._write(state)
                 _LOGGER.warning("[EXIT_ROTATION] account=%s unavailable; current route preserved", token_id)
+                await audit_account_operation(
+                    self.db, token_id, operation="exit_rotation", status="failed", reason="rotation_failed",
+                    stage="rotation", source="exit_rotation", token=token,
+                    details={"proxy_changed": False},
+                )
                 raise _unavailable() from None
 
     async def prepare_token(self, token):
@@ -396,12 +416,19 @@ class ExitRotationManager:
                 return
             state = self._state()
             record = self._record(state, token_id)
+            was_due = record["due"]
             record["count"] += 1
             if record["count"] >= self._policy()["threshold"]:
                 record["due"] = True
                 record["error"] = record["error"] or "threshold"
             self._write(state)
             self._sent.add(identity)
+        if record["due"] and not was_due:
+            await audit_account_operation(
+                self.db, token_id, operation="exit_rotation", status="info", reason="threshold_reached",
+                stage="rotation", source="exit_rotation",
+                details={"count": record["count"], "threshold": self._policy()["threshold"]},
+            )
 
     async def note_error(self, token_id: int, request_id: str, error=None):
         """Schedule a future rotation, without repeating the failed request."""
@@ -415,8 +442,16 @@ class ExitRotationManager:
             return
         async with self._state_lock:
             state = self._state()
-            self._record(state, token_id).update(due=True, error=reason)
+            record = self._record(state, token_id)
+            was_due = record["due"]
+            record.update(due=True, error=reason)
             self._write(state)
+        if not was_due:
+            await audit_account_operation(
+                self.db, token_id, operation="exit_rotation", status="info", reason="rotation_due",
+                stage="rotation", source="exit_rotation",
+                details={"retry_reason": "validation_failed" if reason == "health_error" else "operation_failed"},
+            )
 
     async def release(self, token_id: int, request_id: str):
         token_id = int(token_id)

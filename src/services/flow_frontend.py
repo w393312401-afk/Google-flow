@@ -825,6 +825,7 @@ class FlowFrontendMixin:
             apply_default_client_headers=False,
             return_error_response=True,
             redact_sensitive_logs=True,
+            allow_http1_fallback=rpc_id == "nzlxg",
         )
         xsrf_match = re.search(r'\["xsrf","([^"]+)"', response_text)
         if xsrf_match:
@@ -838,6 +839,7 @@ class FlowFrontendMixin:
                 apply_default_client_headers=False,
                 return_error_response=True,
                 redact_sensitive_logs=True,
+                allow_http1_fallback=rpc_id == "nzlxg",
             )
 
         frames = self._parse_batchexecute_frames(response_text)

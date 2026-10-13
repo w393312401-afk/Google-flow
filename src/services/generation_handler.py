@@ -5,6 +5,7 @@ import base64
 import json
 import re
 import time
+from copy import deepcopy
 from contextlib import aclosing
 from pathlib import Path
 from typing import Optional, AsyncGenerator, List, Dict, Any
@@ -23,6 +24,7 @@ from .file_cache import FileCache
 from .captcha_errors import BrowserCaptchaError
 from .flow_frontend import FlowRPCRejected
 from .submission_ledger import SubmissionLedger
+from ..core.account_admission import AccountAdmissionBusy
 
 
 # Model configuration
@@ -1576,18 +1578,68 @@ class GenerationHandler:
         self._mark_generation_failed(generation_result, message)
         if isinstance(generation_result, dict):
             generation_result["submission_pending"] = True
-        if task_id:
+        persist = getattr(self.db, "persist_interrupted_video_request", None)
+        if task_id and callable(persist):
+            await persist(task_id=task_id, token_id=token.id,
+                log_id=(request_log_state or {}).get("id"), payload=payload,
+                client_submission_id=(request_log_state or {}).get("client_submission_id"),
+                operations=operations, progress=(request_log_state or {}).get("progress", 45))
+        elif task_id:
             await self.db.update_task(
                 task_id, status="status_unknown", error_message=message, completed_at=None,
             )
-        if isinstance(request_log_state, dict) and request_log_state.get("id"):
+        if not callable(persist) and isinstance(request_log_state, dict) and request_log_state.get("id"):
             await self.db.update_request_log(
                 request_log_state["id"], token_id=token.id,
                 response_body=json.dumps({"error": payload}, ensure_ascii=False),
                 status_code=502, status_text="video_status_unknown",
                 progress=request_log_state.get("progress", 45),
             )
+        if isinstance(generation_result, dict):
+            generation_result["video_interruption_persisted"] = True
         return json.dumps({"error": payload}, ensure_ascii=False)
+
+    async def _preserve_interrupted_video(self, token, generation_result, request_log_state, *, reason):
+        """Finish local observation while keeping the original accepted receipt."""
+        if not isinstance(generation_result, dict) or generation_result.get("video_interruption_persisted"):
+            return
+        receipt = generation_result.get("submitted_video")
+        if not receipt or not receipt.get("operations"):
+            return
+        operations = receipt["operations"]
+        operation = operations[0]
+        task_id = (operation.get("operation") or {}).get("name") or operation.get("name")
+        if not task_id:
+            return
+        payload = {"message": "视频已提交，但本地查询已中断；生成结果尚未确认，请查询原提交，勿重复提交",
+            "type": "server_error", "code": "video_status_unknown", "status_code": 502,
+            "submission_pending": True, "upstream_accepted": True, "reason": reason, "task_id": task_id}
+
+        async def persist():
+            task = Task(task_id=task_id, token_id=token.id, model=receipt.get("model", "video"),
+                prompt=receipt.get("prompt", ""), scene_id=receipt.get("scene_id"), status="status_unknown")
+            status = await self.db.persist_interrupted_video_request(
+                task_id=task_id, token_id=token.id, log_id=(request_log_state or {}).get("id"),
+                payload=payload, task=task, project_id=receipt.get("project_id"), operations=operations,
+                client_submission_id=(request_log_state or {}).get("client_submission_id"),
+                progress=(request_log_state or {}).get("progress", 45))
+            if status == "status_unknown":
+                self._mark_generation_failed(generation_result, payload["message"])
+                generation_result["submission_pending"] = True
+            generation_result["video_interruption_persisted"] = True
+
+        cleanup = generation_result.get("video_interruption_task")
+        if cleanup is None:
+            cleanup = asyncio.create_task(persist())
+            generation_result["video_interruption_task"] = cleanup
+        # Repeated disconnect cancellation must not interrupt the transaction
+        # that clears the 102 log, nor release the account before it finishes.
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                continue
+        cleanup.result()
 
     async def check_token_availability(self, is_image: bool, is_video: bool) -> bool:
         """检查Token可用性
@@ -1674,6 +1726,7 @@ class GenerationHandler:
         generation_type = None
         pending_token_state = {"active": False}
         concurrency_slot_acquired = False
+        account_generation_lease = None
         selected_token_id = None
         exit_rotation = getattr(self, "exit_rotation", None)
         rotation_lease_acquired = False
@@ -1746,21 +1799,6 @@ class GenerationHandler:
             yield self._create_stream_chunk(
                 f"✨ {'视频' if generation_type == 'video' else '图片'}生成任务已启动\n",
                 role="assistant",
-            )
-            request_log_state["id"] = await self._log_request(
-                token_id=None,
-                operation=request_operation,
-                request_data=request_payload,
-                response_data={
-                    "status": "processing",
-                    "status_text": "started",
-                    "progress": 0,
-                    "request_id": request_id,
-                },
-                status_code=102,
-                duration=0,
-                status_text="started",
-                progress=0,
             )
 
         # 2. 选择Token
@@ -1836,6 +1874,27 @@ class GenerationHandler:
         selected_token_id = token.id
         pending_token_state["active"] = True
         try:
+            admission = getattr(self.token_manager, "account_admission", None)
+            if admission is not None:
+                try:
+                    account_generation_lease = admission.generation(token.id)
+                except AccountAdmissionBusy:
+                    message = "账号正在维护登录凭证，尚未提交生成，请稍后重试"
+                    await self._log_request(token.id, request_operation, request_payload,
+                        {"error": message, "code": "submission_not_started", "submission_pending": False,
+                         "upstream_accepted": False}, 503, time.time() - start_time, status_text="failed")
+                    yield self._create_error_response(message, status_code=503, code="submission_not_started",
+                        submission_pending=False, upstream_accepted=False)
+                    return
+            # The shared lease covers both response modes, independently of
+            # progress logging. A stream creates its row only after admission;
+            # an unassigned waiter cannot falsely own every browser account.
+            if stream and attempt == 1:
+                request_log_state["id"] = await self._log_request(
+                    token_id=token.id, operation=request_operation, request_data=request_payload,
+                    response_data={"status": "processing", "request_id": request_id},
+                    status_code=102, duration=0, status_text="token_selected", progress=8,
+                )
             if client_submission_id:
                 await SubmissionLedger(self.db).update(client_submission_id, account_id=token.id)
             await self._update_request_log_progress(
@@ -1990,7 +2049,7 @@ class GenerationHandler:
                     yield chunk
             else:  # video
                 debug_logger.log_info(f"[GENERATION] 开始视频生成流程...")
-                async for chunk in self._handle_video_generation(
+                async with aclosing(self._handle_video_generation(
                     token,
                     project_id,
                     model_config,
@@ -2003,8 +2062,9 @@ class GenerationHandler:
                     request_log_state=request_log_state,
                     pending_token_state=pending_token_state,
                     video_media_id=video_media_id,
-                ):
-                    yield chunk
+                )) as chunks:
+                    async for chunk in chunks:
+                        yield chunk
             perf_trace["generation_pipeline_ms"] = int(
                 (time.time() - generation_pipeline_started_at) * 1000
             )
@@ -2118,8 +2178,16 @@ class GenerationHandler:
                 progress=100,
             )
 
-        except asyncio.CancelledError:
-            await mark_rotation_error()
+        except (asyncio.CancelledError, GeneratorExit) as interruption:
+            if not generation_result.get("success"):
+                await mark_rotation_error()
+            if generation_type == "video" and generation_result.get("submitted_video"):
+                await self._preserve_interrupted_video(
+                    token, generation_result, request_log_state,
+                    reason="client_disconnected" if isinstance(interruption, asyncio.CancelledError) else "generator_closed")
+                raise
+            if generation_result.get("success"):
+                raise
             error_msg = "生成已取消: 客户端连接已断开"
             debug_logger.log_warning(f"[GENERATION] ⚠️ {error_msg}")
             duration = time.time() - start_time
@@ -2147,14 +2215,17 @@ class GenerationHandler:
         except Exception as e:
             await mark_rotation_error()
             error_msg = f"生成失败: {str(e)}"
-            # The native runner marks this only before arming its submit button.
-            # Never infer non-submission from an error string or stage name.
+            # Only the native runner's guarded request/cleanup evidence proves
+            # non-submission. A button click or stage name alone cannot do so.
             rejected = isinstance(e, FlowRPCRejected) and e.submission_rejected
             unsubmitted = rejected or (
                 isinstance(e, BrowserCaptchaError)
                 and e.submission_pending is False
             )
             error_code = "submission_rejected" if rejected else ("submission_not_started" if unsubmitted else "generation_failed")
+            native_diagnostic = self._safe_native_submission_diagnostic(
+                getattr(e, "native_submission_diagnostic", None)
+            ) if isinstance(e, BrowserCaptchaError) else None
             debug_logger.log_error(f"[GENERATION] 生成失败: {error_msg}")
             routing_opened = False
             if token:
@@ -2189,6 +2260,8 @@ class GenerationHandler:
                 prompt if len(prompt) <= 2000 else f"{prompt[:2000]}...(truncated)"
             )
             error_data = {"error": error_msg, "performance": perf_trace}
+            if native_diagnostic:
+                error_data["native_submission_diagnostic"] = native_diagnostic
             if unsubmitted:
                 error_data.update(code=error_code, submission_pending=False, upstream_accepted=False)
             await self._log_request(
@@ -2209,7 +2282,9 @@ class GenerationHandler:
                 error_msg, status_code=500, code=error_code,
                 submission_pending=False if unsubmitted else None,
                 upstream_accepted=False if unsubmitted else None,
-                reason=("unusual_activity" if 'UNUSUAL_ACTIVITY' in e.error_code else "upstream_rejected") if rejected else None,
+                reason=(("unusual_activity" if 'UNUSUAL_ACTIVITY' in e.error_code else "upstream_rejected")
+                        if rejected else (e.reason if isinstance(e, BrowserCaptchaError) else None)),
+                native_submission_diagnostic=native_diagnostic,
             ))
             if (
                 retry_state is not None and retry_state.get("allow")
@@ -2247,13 +2322,17 @@ class GenerationHandler:
                             if rotation_lease_acquired:
                                 await exit_rotation.release(selected_token_id, request_id)
                         finally:
-                            if concurrency_slot_acquired:
-                                release_slot = (
-                                    concurrency_manager.release_image
-                                    if generation_type == "image"
-                                    else concurrency_manager.release_video
-                                )
-                                await release_slot(selected_token_id)
+                            try:
+                                if concurrency_slot_acquired:
+                                    release_slot = (
+                                        concurrency_manager.release_image
+                                        if generation_type == "image"
+                                        else concurrency_manager.release_video
+                                    )
+                                    await release_slot(selected_token_id)
+                            finally:
+                                if account_generation_lease is not None:
+                                    account_generation_lease.close()
 
     def _get_no_token_error_message(self, generation_type: str) -> str:
         """获取无可用Token时的详细错误信息"""
@@ -3173,6 +3252,13 @@ class GenerationHandler:
             operation = operations[0]
             task_id = operation["operation"]["name"]
             scene_id = operation.get("sceneId")
+            if isinstance(generation_result, dict):
+                # Keep acceptance evidence before the first database await, so
+                # cancellation during create_task()/accepted() can recover it.
+                generation_result["submitted_video"] = {
+                    "operations": deepcopy(operations), "project_id": project_id,
+                    "model": model_config["model_key"], "prompt": prompt, "scene_id": scene_id,
+                }
 
             # 保存Task到数据库
             task = Task(
@@ -3207,7 +3293,7 @@ class GenerationHandler:
 
             # 如果是 extend，传入源视频 media_id 用于后续拼接
             extend_source_id = video_media_id if video_type == "extend" else None
-            async for chunk in self._poll_video_result(
+            async with aclosing(self._poll_video_result(
                 token,
                 project_id,
                 operations,
@@ -3217,13 +3303,41 @@ class GenerationHandler:
                 response_state,
                 request_log_state,
                 extend_source_media_id=extend_source_id,
-            ):
-                yield chunk
+            )) as chunks:
+                async for chunk in chunks:
+                    yield chunk
 
-        finally:
-            pass
+        except (asyncio.CancelledError, GeneratorExit) as interruption:
+            await self._preserve_interrupted_video(
+                token, generation_result, request_log_state,
+                reason="client_disconnected" if isinstance(interruption, asyncio.CancelledError) else "generator_closed")
+            raise
 
     async def _poll_video_result(
+        self, token, project_id: str, operations: List[Dict], stream: bool,
+        upsample_config: Optional[Dict] = None, generation_result: Optional[Dict[str, Any]] = None,
+        response_state: Optional[Dict[str, Any]] = None, request_log_state: Optional[Dict[str, Any]] = None,
+        extend_source_media_id: Optional[str] = None,
+    ) -> AsyncGenerator:
+        if generation_result is None:
+            generation_result = self._create_generation_result()
+        generation_result.setdefault("submitted_video", {
+            "operations": deepcopy(operations), "project_id": project_id,
+        })
+        try:
+            async with aclosing(self._poll_video_result_inner(
+                token, project_id, operations, stream, upsample_config, generation_result,
+                response_state, request_log_state, extend_source_media_id,
+            )) as chunks:
+                async for chunk in chunks:
+                    yield chunk
+        except (asyncio.CancelledError, GeneratorExit) as interruption:
+            await self._preserve_interrupted_video(
+                token, generation_result, request_log_state,
+                reason="client_disconnected" if isinstance(interruption, asyncio.CancelledError) else "generator_closed")
+            raise
+
+    async def _poll_video_result_inner(
         self,
         token,
         project_id: str,
@@ -3407,7 +3521,7 @@ class GenerationHandler:
                                     )
                                 
                                 # 递归轮询放大结果（不再放大）
-                                async for chunk in self._poll_video_result(
+                                async with aclosing(self._poll_video_result(
                                     token,
                                     project_id,
                                     upsample_operations,
@@ -3416,8 +3530,9 @@ class GenerationHandler:
                                     generation_result,
                                     response_state,
                                     request_log_state,
-                                ):
-                                    yield chunk
+                                )) as chunks:
+                                    async for chunk in chunks:
+                                        yield chunk
                                 return
                             else:
                                 if stream:
@@ -3641,6 +3756,26 @@ class GenerationHandler:
 
         return json.dumps(response, ensure_ascii=False)
 
+    @staticmethod
+    def _safe_native_submission_diagnostic(value):
+        if not isinstance(value, dict):
+            return None
+        result = {}
+        for key in ("stage", "reason", "failure_kind"):
+            item = value.get(key)
+            if isinstance(item, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", item):
+                result[key] = item
+        error_kind = value.get("error_kind")
+        if isinstance(error_kind, str) and error_kind in {"TimeoutError", "Error", "TargetClosedError", "BrowserCaptchaError", "RuntimeError", "TypeError", "ValueError", "CancelledError", "other", "timeout", "browser_operation_failed"}:
+            result["error_kind"] = error_kind
+        for key in ("armed", "request_admitted", "forwarding_started", "request_forwarded", "page_closed"):
+            if type(value.get(key)) is bool:
+                result[key] = value[key]
+        for key in ("submit_attempts", "elapsed_ms"):
+            if type(value.get(key)) is int and 0 <= value[key] <= 3600000:
+                result[key] = value[key]
+        return result or None
+
     def _create_error_response(
         self,
         error_message: str,
@@ -3649,6 +3784,7 @@ class GenerationHandler:
         submission_pending: Optional[bool] = None,
         upstream_accepted: Optional[bool] = None,
         reason: Optional[str] = None,
+        native_submission_diagnostic: Optional[Dict[str, Any]] = None,
     ) -> str:
         """创建错误响应
 
@@ -3673,6 +3809,9 @@ class GenerationHandler:
             error['error']['upstream_accepted'] = upstream_accepted
         if reason is not None:
             error['error']['reason'] = reason
+        diagnostic = self._safe_native_submission_diagnostic(native_submission_diagnostic)
+        if diagnostic:
+            error['error']['native_submission_diagnostic'] = diagnostic
 
         return json.dumps(error, ensure_ascii=False)
 

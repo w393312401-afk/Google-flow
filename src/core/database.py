@@ -2,12 +2,26 @@
 
 import asyncio
 import aiosqlite
+import hashlib
+import hmac
 import json
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 from .config import DEFAULT_YESCAPTCHA_TASK_TYPE, normalize_yescaptcha_task_type
+from .account_audit import (
+    SCHEMA_STATEMENTS as ACCOUNT_AUDIT_SCHEMA,
+    INSERT_SQL as ACCOUNT_AUDIT_INSERT,
+    OPERATIONS as ACCOUNT_AUDIT_OPERATIONS,
+    SOURCES as ACCOUNT_AUDIT_SOURCES,
+    decode_event as decode_account_audit_event,
+    normalize_stored_event as normalize_stored_account_audit_event,
+    sanitize_email as sanitize_audit_email,
+    sanitize_serial as sanitize_audit_serial,
+    audit_account_operation,
+)
+from .account_operation_context import operation_source
 from .models import (
     Token,
     TokenStats,
@@ -720,6 +734,8 @@ class Database:
             # Note: This will NOT overwrite existing config rows
             # It only ensures missing rows are created with default values from setting.toml
             await self._ensure_config_rows(db, config_dict=config_dict)
+            await self._ensure_account_operation_schema(db)
+            await self._ensure_admin_session_schema(db)
 
             await db.commit()
             print("Database migration check completed.")
@@ -811,6 +827,7 @@ class Database:
                     checked_at TIMESTAMP
                 )
             """)
+            await self._ensure_account_operation_schema(db)
 
             # Tasks table
             await db.execute("""
@@ -860,6 +877,7 @@ class Database:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            await self._ensure_admin_session_schema(db)
 
             # Proxy config table
             await db.execute("""
@@ -1175,6 +1193,82 @@ class Database:
 
             return token_id
 
+    async def _ensure_account_operation_schema(self, connection):
+        # No foreign key: snapshots and account IDs survive account deletion.
+        for statement in ACCOUNT_AUDIT_SCHEMA:
+            await connection.execute(statement)
+
+    async def append_account_operation_log(self, event: Dict[str, Any]) -> Optional[int]:
+        """Write a normalized audit event without holding the business write lock."""
+        event = normalize_stored_account_audit_event(event)
+        async with aiosqlite.connect(self.db_path, timeout=1.0) as connection:
+            await connection.execute("PRAGMA busy_timeout = 1000")
+            await self._ensure_account_operation_schema(connection)
+            if event.get("token_id") and (not event.get("token_email") or not event.get("token_serial")):
+                if await self._table_exists(connection, "tokens"):
+                    cursor = await connection.execute(
+                        "SELECT email, login_account, adspower_serial FROM tokens WHERE id=?",
+                        (event["token_id"],),
+                    )
+                    row = await cursor.fetchone()
+                    if row:
+                        event["token_email"] = event.get("token_email") or sanitize_audit_email(row[0] or row[1])
+                        event["token_serial"] = event.get("token_serial") or sanitize_audit_serial(row[2])
+            cursor = await connection.execute(ACCOUNT_AUDIT_INSERT, event)
+            inserted_id = cursor.lastrowid if cursor.rowcount else None
+            if inserted_id is None and event.get("event_key"):
+                cursor = await connection.execute(
+                    "SELECT id FROM account_operation_logs WHERE event_key=?", (event["event_key"],)
+                )
+                row = await cursor.fetchone()
+                inserted_id = row[0] if row else None
+            await connection.commit()
+            return inserted_id
+
+    async def get_account_operation_logs(self, *, page: int = 1, page_size: int = 50,
+                                         token_id: Optional[int] = None,
+                                         operation: Optional[str] = None,
+                                         status: Optional[str] = None,
+                                         source: Optional[str] = None,
+                                         q: Optional[str] = None) -> Dict[str, Any]:
+        page, page_size = max(1, int(page)), min(100, max(1, int(page_size)))
+        result = {"items": [], "total": 0, "page": page, "page_size": page_size,
+                  "operations": sorted(ACCOUNT_AUDIT_OPERATIONS), "sources": sorted(ACCOUNT_AUDIT_SOURCES)}
+        conditions, params = [], []
+        for field, value in (("token_id", token_id), ("operation", operation), ("status", status), ("source", source)):
+            if value is not None and value != "":
+                conditions.append(f"{field} = ?")
+                params.append(value)
+        if q:
+            # Search is a literal fragment, not SQL or an unbounded LIKE pattern.
+            query = str(q)[:254].replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            conditions.append("(token_email LIKE ? ESCAPE '\\' OR token_serial LIKE ? ESCAPE '\\')")
+            params.extend((f"%{query}%", f"%{query}%"))
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        async with self._connect() as connection:
+            if not await self._table_exists(connection, "account_operation_logs"):
+                return result
+            connection.row_factory = aiosqlite.Row
+            # One read transaction keeps totals and page contents consistent.
+            await connection.execute("BEGIN")
+            cursor = await connection.execute("SELECT COUNT(*) FROM account_operation_logs" + where, params)
+            result["total"] = (await cursor.fetchone())[0]
+            cursor = await connection.execute(
+                "SELECT * FROM account_operation_logs" + where + " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                [*params, page_size, (page - 1) * page_size],
+            )
+            result["items"] = [decode_account_audit_event(row) for row in await cursor.fetchall()]
+            return result
+
+    async def get_account_operation_log(self, log_id: int) -> Optional[Dict[str, Any]]:
+        async with self._connect() as connection:
+            if not await self._table_exists(connection, "account_operation_logs"):
+                return None
+            connection.row_factory = aiosqlite.Row
+            cursor = await connection.execute("SELECT * FROM account_operation_logs WHERE id=?", (log_id,))
+            row = await cursor.fetchone()
+            return decode_account_audit_event(row) if row else None
+
     async def get_token(self, token_id: int) -> Optional[Token]:
         """Get token by ID"""
         async with self._connect() as db:
@@ -1347,6 +1441,34 @@ class Database:
                 await db.execute(query, params)
                 await db.commit()
 
+    async def commit_recovered_credentials(
+        self, expected: Token, *, google_cookies: str, at: str,
+        at_expires: datetime, credits: float, user_paygate_tier: Optional[str] = None,
+    ) -> bool:
+        """Accept verified credentials only if the bound account is still unchanged."""
+        async with self._connect(write=True) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM tokens WHERE id = ?", (expected.id,))
+            row = await cursor.fetchone()
+            current = Token(**dict(row)) if row is not None else None
+            ignored = {"created_at", "last_used_at", "use_count", "credits", "user_paygate_tier",
+                       "last_st_refresh_at", "last_st_refresh_result"}
+            if current is None or any(
+                getattr(current, key) != getattr(expected, key)
+                for key in Token.model_fields if key not in ignored
+            ):
+                await db.rollback()
+                return False
+            await db.execute(
+                "UPDATE tokens SET google_cookies = ?, at = ?, at_expires = ?, credits = ?, "
+                "user_paygate_tier = ? WHERE id = ?",
+                (google_cookies, at, at_expires, credits, user_paygate_tier, expected.id),
+            )
+            await db.execute("DELETE FROM token_health WHERE token_id = ?", (expected.id,))
+            await db.commit()
+            return True
+
     async def delete_token(self, token_id: int):
         """Delete token and related data"""
         async with self._connect(write=True) as db:
@@ -1431,6 +1553,246 @@ class Database:
             await db.commit()
 
     # Task operations
+    @staticmethod
+    def _json_record(value) -> Dict[str, Any]:
+        try:
+            parsed = json.loads(value or "null")
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @classmethod
+    def _log_operation_ids(cls, row):
+        response = cls._json_record(row["response_body"])
+        observed_ids = set()
+        for value in (response, response.get("error"), response.get("submission")):
+            if isinstance(value, dict):
+                observed_ids.update(str(value[key]) for key in ("task_id", "operation_id", "upstream_task_id") if value.get(key))
+        return observed_ids
+
+    @classmethod
+    def _receipt_log_matches(cls, row, submission_id, account_id, operation_id):
+        """Associate a log by durable IDs, never by its prompt or elapsed time."""
+        if row["token_id"] not in (None, account_id):
+            return False
+        request = cls._json_record(row["request_body"])
+        recorded_submission = request.get("client_submission_id")
+        if recorded_submission and recorded_submission != submission_id:
+            return False
+        observed_ids = cls._log_operation_ids(row)
+        if observed_ids and observed_ids != {operation_id}:
+            return False
+        return (recorded_submission == submission_id or
+                (row["token_id"] == account_id and observed_ids == {operation_id}))
+
+    async def _finish_submission_in_transaction(self, db, receipt) -> Dict[str, int]:
+        """Repair task/log projections of an already proven terminal receipt."""
+        counts = {"tasks": 0, "logs": 0}
+        account_id, operation_id = receipt["account_id"], receipt["operation_id"]
+        state = receipt["state"]
+        failure = self._json_record(receipt["error"])
+        confirmed = state == "confirmed" and bool(receipt["video_url"])
+        failed = (state == "failed" and failure.get("code") == "video_generation_failed"
+                  and failure.get("submission_pending") is False and failure.get("upstream_accepted") is True
+                  and failure.get("operation_id", operation_id) == operation_id)
+        if account_id is None or not operation_id or not (confirmed or failed):
+            return counts
+        status = "completed" if confirmed else "failed"
+        message = "" if confirmed else failure.get("message") or "视频生成失败"
+        if await self._table_exists(db, "tasks"):
+            cursor = await db.execute(
+                "UPDATE tasks SET status=?,progress=CASE WHEN ?='completed' THEN 100 ELSE progress END,"
+                "result_urls=CASE WHEN ?='completed' THEN ? ELSE result_urls END,error_message=?,"
+                "completed_at=COALESCE(completed_at,CURRENT_TIMESTAMP) WHERE task_id=? AND token_id=? "
+                "AND status IN ('processing','running','queued','pending','submitted','status_unknown',?)",
+                (status, status, status, json.dumps([receipt["video_url"]]) if confirmed else None,
+                 message, operation_id, account_id, status),
+            )
+            counts["tasks"] = cursor.rowcount
+        if not await self._table_exists(db, "request_logs"):
+            return counts
+        cursor = await db.execute(
+            "SELECT * FROM request_logs WHERE (token_id=? OR token_id IS NULL) "
+            "AND (status_code=102 OR status_text IN ('status_unknown','video_status_unknown'))",
+            (account_id,),
+        )
+        for log in await cursor.fetchall():
+            if not self._receipt_log_matches(log, receipt["client_submission_id"], account_id, operation_id):
+                continue
+            response = ({"status": "success", "task_id": operation_id, "url": receipt["video_url"]}
+                        if confirmed else {"error": dict(failure, task_id=operation_id, operation_id=operation_id)})
+            previous = self._json_record(log["response_body"])
+            if previous:
+                response["previous_observation"] = previous.get("previous_observation", previous)
+            cursor = await db.execute(
+                "UPDATE request_logs SET token_id=?,status_code=?,status_text=?,response_body=?,"
+                "progress=CASE WHEN ?='completed' THEN 100 ELSE progress END,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (account_id, 200 if confirmed else 502, status, json.dumps(response, ensure_ascii=False), status, log["id"]),
+            )
+            counts["logs"] += cursor.rowcount
+        return counts
+
+    async def reconcile_submission_terminal(
+        self, submission_id: str, *, account_id: int, operation_id: str,
+        state: Optional[str] = None, video_url: Optional[str] = None, error: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Atomically settle one exact receipt and its task/log projections.
+
+        Passing no state repairs an existing proven terminal result. Observation
+        failures and active upstream results never end the original local worker.
+        """
+        async with self._connect(write=True) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            db.row_factory = aiosqlite.Row
+            if not await self._table_exists(db, "client_submissions"):
+                return {"status": "binding_mismatch", "tasks": 0, "logs": 0}
+            cursor = await db.execute("SELECT * FROM client_submissions WHERE client_submission_id=?", (submission_id,))
+            row = await cursor.fetchone()
+            if row is None or row["account_id"] != account_id or row["operation_id"] != operation_id:
+                return {"status": "binding_mismatch", "tasks": 0, "logs": 0}
+            if state is not None:
+                proven = (state == "confirmed" and bool(video_url)) or (
+                    state == "failed" and isinstance(error, dict) and error.get("code") == "video_generation_failed"
+                    and error.get("submission_pending") is False and error.get("upstream_accepted") is True
+                    and error.get("operation_id") == operation_id)
+                if not proven or row["state"] not in ("pending", state):
+                    return {"status": "receipt_conflict", "tasks": 0, "logs": 0}
+                await db.execute(
+                    "UPDATE client_submissions SET state=?,video_url=?,error=?,updated_at=CURRENT_TIMESTAMP "
+                    "WHERE client_submission_id=? AND account_id=? AND operation_id=?",
+                    (state, video_url if state == "confirmed" else row["video_url"],
+                     json.dumps(error, ensure_ascii=False) if error is not None else None,
+                     submission_id, account_id, operation_id),
+                )
+                cursor = await db.execute("SELECT * FROM client_submissions WHERE client_submission_id=?", (submission_id,))
+                row = await cursor.fetchone()
+            counts = await self._finish_submission_in_transaction(db, row)
+            await db.commit()
+            return {"status": row["state"], **counts}
+
+    async def reconcile_interrupted_requests(
+        self, *, before: datetime, local_workers_stopped: bool = False,
+        token_id: Optional[int] = None, task_ids: Optional[List[int]] = None,
+    ) -> Dict[str, int]:
+        """Close previous-worker requests while retaining every upstream receipt.
+
+        The caller must prove exclusive ownership of the service database, or
+        hold the selected account's maintenance lock and prove its workers ended.
+        A timestamp alone is not such proof. A task_ids scope never touches other
+        requests on the account, including requests created after the cutoff.
+        """
+        if local_workers_stopped is not True:
+            raise ValueError("local_workers_stopped proof is required")
+        if not isinstance(before, datetime) or before.tzinfo is None:
+            raise ValueError("an aware UTC cutoff is required")
+        cutoff = before.astimezone(timezone.utc).isoformat()
+        counts = {"tasks_unknown": 0, "logs_closed": 0, "terminal_tasks": 0, "terminal_logs": 0}
+        async with self._connect(write=True) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            db.row_factory = aiosqlite.Row
+            conditions, params = ["julianday(created_at)<julianday(?)"], [cutoff]
+            if token_id is not None:
+                conditions.append("token_id=?")
+                params.append(token_id)
+            if task_ids is not None:
+                if not task_ids:
+                    return counts
+                conditions.append("id IN (" + ",".join("?" for _ in task_ids) + ")")
+                params.extend(task_ids)
+            cursor = await db.execute("SELECT * FROM tasks WHERE " + " AND ".join(conditions), params)
+            tasks = await cursor.fetchall()
+            receipts = []
+            if await self._table_exists(db, "client_submissions"):
+                cursor = await db.execute("SELECT * FROM client_submissions")
+                receipts = await cursor.fetchall()
+            by_operation = {}
+            by_submission = {row["client_submission_id"]: row for row in receipts}
+            for row in receipts:
+                by_operation.setdefault((row["account_id"], row["operation_id"]), []).append(row)
+            selected_operations = set()
+            active = {"processing", "running", "queued", "pending", "submitted", "status_unknown"}
+            for task in tasks:
+                selected_operations.add((task["token_id"], task["task_id"]))
+                matching = by_operation.get((task["token_id"], task["task_id"]), [])
+                # Ambiguous receipts and contradictory evidence remain untouched.
+                if len(matching) > 1 or (matching and matching[0]["state"] == "refused"):
+                    continue
+                receipt = matching[0] if matching else None
+                if receipt and receipt["state"] in ("confirmed", "failed"):
+                    repaired = await self._finish_submission_in_transaction(db, receipt)
+                    counts["terminal_tasks"] += repaired["tasks"]
+                    counts["terminal_logs"] += repaired["logs"]
+                    continue
+                if task["status"] not in active:
+                    continue
+                message = "本地生成进程已结束；原视频结果尚未确认，请查询原提交，勿重复提交"
+                cursor = await db.execute(
+                    "UPDATE tasks SET status='status_unknown',error_message=?,completed_at=NULL WHERE id=?",
+                    (message, task["id"]),
+                )
+                counts["tasks_unknown"] += cursor.rowcount
+            cursor = await db.execute(
+                "SELECT * FROM request_logs WHERE status_code=102 AND julianday(created_at)<julianday(?) "
+                "AND julianday(COALESCE(updated_at,created_at))<julianday(?)"
+                + (" AND token_id=?" if token_id is not None else ""),
+                (cutoff, cutoff, token_id) if token_id is not None else (cutoff, cutoff),
+            )
+            for log in await cursor.fetchall():
+                if log["operation"] not in ("generate_image", "generate_video", "extend_video"):
+                    continue
+                request = self._json_record(log["request_body"])
+                receipt = by_submission.get(request.get("client_submission_id"))
+                if receipt and log["token_id"] not in (None, receipt["account_id"]):
+                    continue
+                operation_id = receipt["operation_id"] if receipt else None
+                account_id = receipt["account_id"] if receipt else log["token_id"]
+                if not operation_id:
+                    observed_ids = self._log_operation_ids(log)
+                    if len(observed_ids) == 1:
+                        observed_id = next(iter(observed_ids))
+                        if (account_id, observed_id) in selected_operations:
+                            operation_id = observed_id
+                if task_ids is not None and (account_id, operation_id) not in selected_operations:
+                    continue
+                if receipt and operation_id:
+                    if not self._receipt_log_matches(log, receipt["client_submission_id"], account_id, operation_id):
+                        continue
+                    if receipt["state"] in ("confirmed", "failed"):
+                        repaired = await self._finish_submission_in_transaction(db, receipt)
+                        counts["terminal_logs"] += repaired["logs"]
+                        continue
+                    if receipt["state"] != "pending":
+                        continue
+                message = "本地请求因服务进程结束而中断；上游提交结果尚未确认，请勿重复提交"
+                error = {"code": "request_interrupted", "message": message, "reason": "service_restarted",
+                         "submission_pending": True, "upstream_accepted": None}
+                code, status = 503, "failed"  # End the local request, not an unconfirmed upstream generation.
+                if operation_id:
+                    error.update(code="video_status_unknown", task_id=operation_id, operation_id=operation_id,
+                                 upstream_accepted=True)
+                    code, status = 502, "video_status_unknown"
+                previous = self._json_record(log["response_body"])
+                proof = previous.get("error")
+                if (not operation_id and isinstance(proof, dict) and proof.get("submission_pending") is False
+                        and proof.get("upstream_accepted") is False
+                        and proof.get("code") in ("submission_not_started", "submission_rejected", "no_available_token")):
+                    error = proof
+                    if receipt and receipt["state"] == "pending":
+                        await db.execute("UPDATE client_submissions SET state='refused',error=?,updated_at=CURRENT_TIMESTAMP "
+                                         "WHERE client_submission_id=? AND operation_id IS NULL AND state='pending'",
+                                         (json.dumps(proof, ensure_ascii=False), receipt["client_submission_id"]))
+                response = {"error": error}
+                if previous:
+                    response["previous_observation"] = previous.get("previous_observation", previous)
+                cursor = await db.execute(
+                    "UPDATE request_logs SET token_id=?,status_code=?,status_text=?,response_body=?,updated_at=CURRENT_TIMESTAMP "
+                    "WHERE id=? AND status_code=102",
+                    (account_id, code, status, json.dumps(response, ensure_ascii=False), log["id"]),
+                )
+                counts["logs_closed"] += cursor.rowcount
+            await db.commit()
+        return counts
+
     async def create_task(self, task: Task) -> int:
         """Create a new task"""
         async with self._connect(write=True) as db:
@@ -1467,6 +1829,126 @@ class Database:
                     task_dict["result_urls"] = json.loads(task_dict["result_urls"])
                 return Task(**task_dict)
             return None
+
+    async def persist_interrupted_video_request(
+        self, *, task_id: str, token_id: int, log_id: Optional[int], payload: Dict[str, Any],
+        task: Optional[Task] = None, client_submission_id: Optional[str] = None,
+        project_id: Optional[str] = None, operations: Optional[List[Dict[str, Any]]] = None,
+        progress: int = 45,
+    ) -> str:
+        """Close a local video observer without changing a confirmed upstream result."""
+        operation = operations[0] if operations else {}
+        operation_id = (operation.get("operation") or {}).get("name") or operation.get("name")
+        if operation_id != task_id or (task is not None and (task.task_id != task_id or task.token_id != token_id)):
+            return "binding_mismatch"
+        async with self._connect(write=True) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
+            row = await cursor.fetchone()
+            if row is not None and row["token_id"] != token_id:
+                await db.rollback()
+                return "binding_mismatch"
+            if row is None and task is None:
+                await db.rollback()
+                return "binding_mismatch"
+            receipt = None
+            if client_submission_id and await self._table_exists(db, "client_submissions"):
+                cursor = await db.execute("SELECT * FROM client_submissions WHERE client_submission_id=?", (client_submission_id,))
+                receipt = await cursor.fetchone()
+            exact_receipt = (receipt is not None and receipt["account_id"] == token_id
+                             and receipt["operation_id"] == task_id)
+            compatible_receipt = (receipt is not None and receipt["account_id"] in (None, token_id)
+                                  and receipt["operation_id"] in (None, task_id))
+            if compatible_receipt and receipt["state"] == "refused":
+                # Refusal and an accepted operation conflict; keep both pieces
+                # of evidence intact rather than inventing an unresolved task.
+                await db.rollback()
+                return "receipt_terminal"
+            if row is None and task is not None:
+                await db.execute(
+                    "INSERT INTO tasks (task_id,token_id,model,prompt,status,progress,scene_id) VALUES (?,?,?,?,?,?,?)",
+                    (task_id, token_id, task.model, task.prompt, "status_unknown", progress, task.scene_id),
+                )
+            status = row["status"] if row is not None else "status_unknown"
+            pending_states = {"processing", "running", "queued", "pending", "submitted", "status_unknown"}
+            resolved_urls = None
+            resolved_error = None
+            if exact_receipt and receipt["state"] in {"confirmed", "failed"} and status in pending_states:
+                if receipt["state"] == "confirmed" and receipt["video_url"]:
+                    resolved_urls = [receipt["video_url"]]
+                    status = "completed"
+                    await db.execute("UPDATE tasks SET status='completed',progress=100,result_urls=?,error_message='',"
+                                     "completed_at=CURRENT_TIMESTAMP WHERE task_id=?",
+                                     (json.dumps(resolved_urls), task_id))
+                elif receipt["state"] == "failed":
+                    try:
+                        failure = json.loads(receipt["error"] or "null")
+                    except (TypeError, ValueError):
+                        failure = None
+                    if (not isinstance(failure, dict) or failure.get("code") != "video_generation_failed"
+                            or failure.get("submission_pending") is not False or failure.get("upstream_accepted") is not True):
+                        await db.rollback()
+                        return "receipt_terminal"
+                    resolved_error = failure.get("message") or "视频生成失败"
+                    status = "failed"
+                    await db.execute("UPDATE tasks SET status='failed',error_message=?,completed_at=CURRENT_TIMESTAMP WHERE task_id=?",
+                                     (resolved_error, task_id))
+                else:
+                    await db.rollback()
+                    return "receipt_terminal"
+            # Unknown future states are left intact rather than assumed active.
+            terminal = status not in pending_states
+            response = {"error": payload}
+            code, text = 502, "video_status_unknown"
+            if status in {"completed", "success"}:
+                urls = resolved_urls if resolved_urls is not None else json.loads(row["result_urls"] or "[]")
+                response = {"status": "success", "task_id": task_id}
+                if urls:
+                    response["url"] = urls[0]
+                code, text, progress = 200, "completed", 100
+            elif status in {"failed", "error", "cancelled", "canceled"}:
+                response = {"error": {"message": resolved_error or row["error_message"] or "视频生成失败",
+                    "code": "video_generation_failed", "task_id": task_id,
+                    "submission_pending": False, "upstream_accepted": True}}
+                code, text = 502, "failed"
+            elif not terminal:
+                await db.execute(
+                    "UPDATE tasks SET status='status_unknown',error_message=?,completed_at=NULL "
+                    "WHERE task_id=? AND status NOT IN ('completed','failed','cancelled','canceled')",
+                    (payload["message"], task_id),
+                )
+                status = "status_unknown"
+            if log_id:
+                cursor = await db.execute("SELECT response_body FROM request_logs WHERE id=?", (log_id,))
+                previous = await cursor.fetchone()
+                try:
+                    observation = json.loads(previous["response_body"]) if previous else None
+                    if isinstance(observation, dict):
+                        response["previous_observation"] = observation.get("previous_observation", observation)
+                except (TypeError, ValueError):
+                    pass
+                await db.execute(
+                    "UPDATE request_logs SET token_id=?,response_body=?,status_code=?,status_text=?,progress=?,"
+                    "updated_at=CURRENT_TIMESTAMP WHERE id=? AND (token_id IS NULL OR token_id=?) "
+                    "AND status_text NOT IN ('completed','failed') AND (status_code=102 OR status_text='video_status_unknown')",
+                    (token_id, json.dumps(response, ensure_ascii=False), code, text, progress, log_id, token_id),
+                )
+            if (not terminal and client_submission_id and operations
+                    and await self._table_exists(db, "client_submissions")):
+                # Fill a receipt interrupted during accepted(), but keep an
+                # existing operation snapshot and every terminal receipt intact.
+                error = dict(payload, client_submission_id=client_submission_id, operation_id=task_id, account_id=token_id)
+                await db.execute(
+                    "UPDATE client_submissions SET account_id=COALESCE(account_id,?),operation_id=COALESCE(operation_id,?),"
+                    "project_id=COALESCE(project_id,?),operations=COALESCE(operations,?),error=?,updated_at=CURRENT_TIMESTAMP "
+                    "WHERE client_submission_id=? AND state='pending' AND (account_id IS NULL OR account_id=?) "
+                    "AND (operation_id IS NULL OR operation_id=?)",
+                    (token_id, task_id, project_id, json.dumps(operations, ensure_ascii=False),
+                     json.dumps(error, ensure_ascii=False), client_submission_id, token_id, task_id),
+                )
+            await db.commit()
+            return status
 
     async def update_task(self, task_id: str, **kwargs):
         """Update task"""
@@ -1652,6 +2134,117 @@ class Database:
             )
             await db.commit()
 
+    # Admin sessions
+    async def _ensure_admin_session_schema(self, db):
+        """Persist only hashed browser credentials and their fixed UTC expiry."""
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS admin_sessions (
+                token_hash TEXT PRIMARY KEY NOT NULL,
+                credentials_hash TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                expires_at REAL NOT NULL
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at ON admin_sessions(expires_at)"
+        )
+
+    @staticmethod
+    def _admin_session_token_hash(token: str) -> Optional[str]:
+        if (
+            not isinstance(token, str)
+            or not token
+            or len(token) > 1024
+            or not token.isascii()
+            or any(not character.isprintable() or character.isspace() for character in token)
+        ):
+            return None
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _admin_credentials_hash(username: str, password: str) -> str:
+        credentials = json.dumps([username, password], ensure_ascii=False)
+        return hashlib.sha256(credentials.encode("utf-8")).hexdigest()
+
+    async def create_admin_session(
+        self,
+        token: str,
+        ttl_seconds: int = 30 * 24 * 60 * 60,
+        *,
+        expected_credentials: Optional[tuple[str, str]] = None,
+    ) -> datetime:
+        """Save an opaque session, returning its UTC expiration time."""
+        token_hash = self._admin_session_token_hash(token)
+        if token_hash is None:
+            raise ValueError("Invalid admin session token")
+        if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int) or ttl_seconds <= 0:
+            raise ValueError("Admin session lifetime must be a positive number of seconds")
+        now = datetime.now(timezone.utc)
+        expires_at = now + timedelta(seconds=ttl_seconds)
+        async with self._connect(write=True) as db:
+            # Serialize credential reads and session insertion across workers.
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT username, password FROM admin_config WHERE id = 1"
+            )
+            credentials = await cursor.fetchone()
+            if credentials is None:
+                raise RuntimeError("Admin configuration is not initialized")
+            credentials_hash = self._admin_credentials_hash(*credentials)
+            if expected_credentials is not None and not hmac.compare_digest(
+                credentials_hash, self._admin_credentials_hash(*expected_credentials)
+            ):
+                raise ValueError("Admin credentials changed before session creation")
+            await db.execute(
+                "DELETE FROM admin_sessions WHERE expires_at <= ? OR credentials_hash != ?",
+                (now.timestamp(), credentials_hash),
+            )
+            # A fresh opaque token is required; live collisions are rejected.
+            await db.execute(
+                """
+                INSERT INTO admin_sessions (token_hash, credentials_hash, created_at, expires_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (token_hash, credentials_hash, now.timestamp(), expires_at.timestamp()),
+            )
+            await db.commit()
+        return expires_at
+
+    async def is_admin_session_valid(self, token: str) -> bool:
+        """Validate committed state directly so revocation applies to every worker."""
+        token_hash = self._admin_session_token_hash(token)
+        if token_hash is None:
+            return False
+        async with self._connect() as db:
+            cursor = await db.execute(
+                """
+                SELECT sessions.credentials_hash, admin.username, admin.password
+                FROM admin_sessions AS sessions
+                JOIN admin_config AS admin ON admin.id = 1
+                WHERE sessions.token_hash = ? AND sessions.expires_at > ?
+                """,
+                (token_hash, datetime.now(timezone.utc).timestamp()),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            return False
+        return hmac.compare_digest(row[0], self._admin_credentials_hash(row[1], row[2]))
+
+    async def revoke_admin_session(self, token: str):
+        """Revoke one browser session; malformed and unknown tokens are harmless."""
+        token_hash = self._admin_session_token_hash(token)
+        if token_hash is None:
+            return
+        async with self._connect(write=True) as db:
+            await db.execute("DELETE FROM admin_sessions WHERE token_hash = ?", (token_hash,))
+            await db.commit()
+
+    async def revoke_all_admin_sessions(self):
+        """Revoke all browser sessions without an in-memory validation cache."""
+        async with self._connect(write=True) as db:
+            await db.execute("DELETE FROM admin_sessions")
+            await db.commit()
+
     # Config operations
     async def get_admin_config(self) -> Optional[AdminConfig]:
         """Get admin configuration"""
@@ -1666,6 +2259,11 @@ class Database:
     async def update_admin_config(self, **kwargs):
         """Update admin configuration"""
         async with self._connect(write=True) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT username, password FROM admin_config WHERE id = 1"
+            )
+            previous_credentials = await cursor.fetchone()
             updates = []
             params = []
 
@@ -1678,6 +2276,11 @@ class Database:
                 updates.append("updated_at = CURRENT_TIMESTAMP")
                 query = f"UPDATE admin_config SET {', '.join(updates)} WHERE id = 1"
                 await db.execute(query, params)
+                if previous_credentials and any(
+                    kwargs.get(key) is not None and kwargs[key] != previous_credentials[index]
+                    for index, key in enumerate(("username", "password"))
+                ):
+                    await db.execute("DELETE FROM admin_sessions")
                 await db.commit()
 
     async def get_proxy_config(self) -> Optional[ProxyConfig]:
@@ -2673,8 +3276,10 @@ class Database:
         self,
         enabled: Optional[bool] = None,
         refresh_interval_minutes: Optional[int] = None,
+        *, apply_to_active_tokens: bool = False,
     ) -> TokenRefreshConfig:
         """Update protocol ST refresh configuration."""
+        changed_tokens = []
         async with self._connect(write=True) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM token_refresh_config WHERE id = 1")
@@ -2710,6 +3315,27 @@ class Database:
                 """,
                     (new_enabled, new_interval),
                 )
+            if apply_to_active_tokens and new_enabled:
+                cursor = await db.execute(
+                    """SELECT id, email, login_account, adspower_serial FROM tokens
+                       WHERE is_active = 1 AND
+                       (COALESCE(auto_refresh_enabled, 0) != 1 OR
+                        COALESCE(refresh_interval_minutes, 120) != ?)""",
+                    (new_interval,),
+                )
+                changed_tokens = [dict(item) for item in await cursor.fetchall()]
+                await db.execute(
+                    """UPDATE tokens SET auto_refresh_enabled = 1, refresh_interval_minutes = ?
+                       WHERE is_active = 1""",
+                    (new_interval,),
+                )
             await db.commit()
 
+        for item in changed_tokens:
+            await audit_account_operation(
+                self, item["id"], operation="config_update", status="success",
+                reason="settings_updated", stage="settings", source=operation_source(),
+                token=item, details={"setting": "token_refresh", "auto_refresh_enabled": True,
+                                    "refresh_interval_minutes": new_interval},
+            )
         return await self.get_token_refresh_config()

@@ -24,7 +24,7 @@ IMAGE_MODEL = next(
 
 
 def unsubmitted(stage="editor_readiness", reason="editor_missing"):
-    """The native runner's explicit proof that its submit button was never armed."""
+    """The native runner's explicit guarded cleanup evidence that nothing was sent."""
     failure = BrowserCaptchaError(stage, reason)
     failure.submission_pending = False
     return failure
@@ -114,6 +114,29 @@ class GenerationAccountRetryTests(unittest.IsolatedAsyncioTestCase):
             failed_account, for_video_generation=True, model=VIDEO_MODEL,
         ))
         self.assertEqual(self.balancer._video_pending, {})
+
+    async def test_new_native_actionability_failures_automatically_use_one_other_account(self):
+        await self.add_token(), await self.add_token()
+        for reason in ("browser_closed", "element_detached", "click_intercepted", "submit_disabled"):
+            with self.subTest(reason=reason):
+                self.attempts = []
+                self.outcomes = [unsubmitted("native_submit", reason)]
+                handler = self.make_handler()
+                responses = await self.collect(handler)
+                self.assertEqual(len(self.attempts), 2)
+                self.assertNotEqual(self.attempts[0], self.attempts[1])
+                self.assertEqual(responses, [f"video-from-{self.attempts[1]}"])
+                self.assertEqual(self.logged_statuses(handler), [500, 200])
+                handler.token_manager.record_error.assert_not_awaited()
+                failed_account = await self.db.get_token(self.attempts[0])
+                self.assertTrue(failed_account.is_active)
+                self.assertIsNotNone(self.balancer.get_generation_cooldown_reason(
+                    failed_account, for_video_generation=True, model=VIDEO_MODEL,
+                ))
+                self.balancer.record_generation_success(
+                    failed_account.id, for_video_generation=True, model=VIDEO_MODEL, token=failed_account,
+                )
+                self.assertEqual(self.balancer._video_pending, {})
 
     async def test_stream_announces_the_retry_without_showing_the_first_error(self):
         await self.add_token(), await self.add_token()

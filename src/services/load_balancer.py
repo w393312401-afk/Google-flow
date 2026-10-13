@@ -18,6 +18,7 @@ from ..core.account_tiers import (
 )
 from .concurrency_manager import ConcurrencyManager
 from ..core.logger import debug_logger
+from ..core.account_audit import audit_account_operation
 from .captcha_errors import BrowserCaptchaError
 from .flow_frontend import FlowRPCRejected
 from .token_manager import TokenManager
@@ -87,6 +88,8 @@ class LoadBalancer:
             model_scope = model if reason in {"model_failed", "verify_model_failed", "resolution_failed"} else None
         elif stage == "native_frame_upload" and re.fullmatch(r"(?:frame_[12]_(?:open|chooser|binding|bound)_failed|frame_slots_failed|initial_slots_not_empty|other_slot_changed|uploaded_asset_mismatch|frame_binding_changed)", reason):
             model_scope = None
+        elif stage in {"native_page_creation", "native_route_registration"} and reason == "browser_closed":
+            model_scope = None
         elif stage in {
             "navigation", "page_loaded", "editor_readiness", "editor_wait", "editor_input", "submit_button",
             "page_warmup", "recaptcha_readiness", "native_page_prepare", "native_page_prepare_retry",
@@ -97,6 +100,7 @@ class LoadBalancer:
             "submit_unavailable", "proxy_connection_failed", "editor_missing",
             "network_empty_response", "network_connection_failed", "navigation_interrupted",
             "submit_control_missing", "submit_control_not_ready",
+            "browser_closed", "element_detached", "click_intercepted", "submit_disabled",
         }:
             model_scope = None
         else:
@@ -154,6 +158,13 @@ class LoadBalancer:
         debug_logger.logger.warning(
             "[GENERATION_HEALTH] scope=%s reason=%s decision=cooldown seconds=%s",
             scope, reason, cooldown_seconds,
+        )
+        await audit_account_operation(
+            getattr(self.token_manager, "db", None), token_id,
+            operation="generation", status="cooldown",
+            reason="traffic_restriction" if isinstance(error, FlowRPCRejected) else getattr(error, "reason", "validation_failed"),
+            stage=getattr(error, "stage", "routing"), source="generation", token=token,
+            details={"cooldown_seconds": cooldown_seconds, "attempt": failures},
         )
         return True
 
@@ -389,6 +400,13 @@ class LoadBalancer:
         except Exception as exc:
             return False, f"扩展路由检查失败: {exc}"
 
+    async def _audit_selection_failure(self, token_count: int):
+        await audit_account_operation(
+            getattr(self.token_manager, "db", None),
+            operation="account_selection", status="failed", reason="account_selection_failed",
+            stage="selection", source="generation", details={"token_count": token_count},
+        )
+
     async def select_token(
         self,
         for_image_generation: bool = False,
@@ -437,6 +455,7 @@ class LoadBalancer:
 
         if not active_tokens:
             debug_logger.log_info(f"[LOAD_BALANCER] ❌ 没有活跃的Token")
+            await self._audit_selection_failure(0)
             return None
 
         available_tokens = []
@@ -448,6 +467,10 @@ class LoadBalancer:
         excluded = set(exclude_token_ids or ())
 
         for token in active_tokens:
+            admission = getattr(self.token_manager, "account_admission", None)
+            if admission is not None and admission.maintenance_active(token.id):
+                filtered_reasons[token.id] = "账号正在维护登录凭证"
+                continue
             if token.id in excluded:
                 filtered_reasons[token.id] = "本次请求已在该账号失败，改用其他账号"
                 continue
@@ -545,6 +568,7 @@ class LoadBalancer:
             debug_logger.log_info(
                 f"[LOAD_BALANCER] ❌ 没有可用的Token (图片生成={for_image_generation}, 视频生成={for_video_generation})"
             )
+            await self._audit_selection_failure(len(active_tokens))
             return None
 
         # 最低 in-flight 优先；有并发上限时，剩余槽位更多的 token 优先；最后随机打散
@@ -675,6 +699,12 @@ class LoadBalancer:
                     f"余额: {token.credits}, inflight={item['inflight']}"
                 )
                 selected = True
+                await audit_account_operation(
+                    getattr(self.token_manager, "db", None), token.id,
+                    operation="account_selection", status="success", reason="account_selected",
+                    stage="selection", source="generation", token=token,
+                    details={"credits": token.credits},
+                )
                 return token
             finally:
                 if track_pending and not selected:
@@ -690,6 +720,7 @@ class LoadBalancer:
         debug_logger.log_info(
             f"[LOAD_BALANCER] ❌ 候选Token均不可用 (图片生成={for_image_generation}, 视频生成={for_video_generation})"
         )
+        await self._audit_selection_failure(len(active_tokens))
         return None
 
     async def get_unavailable_reason(

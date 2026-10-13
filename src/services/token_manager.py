@@ -11,8 +11,11 @@ from ..core.config import config
 from ..core.models import Token, Project
 from ..core.logger import debug_logger
 from ..core.monitoring import record_token_refresh
+from ..core.account_audit import audit_account_operation
+from ..core.account_operation_context import account_error_reason, account_operation_source, operation_source
 from .flow_client import FlowClient
 from .proxy_manager import ProxyManager
+from ..core.account_admission import AccountAdmission, AccountAdmissionBusy
 
 
 class TokenManager:
@@ -38,6 +41,24 @@ class TokenManager:
         self._validation_retry_after: dict[int, tuple[str, float, str]] = {}
         self._protocol_retry_after: dict[int, tuple[str, float, str]] = {}
         self._protocol_refresher_task: Optional[asyncio.Task] = None
+        self._credential_recovery = None
+        db_path = getattr(db, "db_path", None)
+        self.account_admission = AccountAdmission(db_path) if isinstance(db_path, (str, bytes)) else None
+
+    async def recover_credentials(self, token_id: int) -> Dict[str, Any]:
+        """Manually recover a fixed AdsPower account through its login host."""
+        if self._credential_recovery is None:
+            from .credential_recovery import CredentialRecovery
+
+            self._credential_recovery = CredentialRecovery(self)
+        return await self._credential_recovery.recover(token_id)
+
+    async def _audit(self, token_id, operation, status, reason="", *,
+                     stage="result", details=None, token=None, source="system"):
+        await audit_account_operation(
+            self.db, token_id, operation=operation, status=status, reason=reason,
+            stage=stage, source=operation_source(source), details=details, token=token,
+        )
 
     async def _get_token_lock(
         self,
@@ -313,6 +334,11 @@ class TokenManager:
             reason.partition(":")[0], error if error is not None else reason
         )
         self._last_health_diagnostic[token_id] = diagnostic
+        await self._audit(
+            token_id, "health_check", "failed", account_error_reason(reason),
+            stage=diagnostic[0], token=token,
+            details={"auth_evidence": diagnostic[1], "decision": "unavailable"},
+        )
         # Traffic controls and browser/network availability do not prove bad
         # credentials. Keep the account enabled but stop each queued request
         # from repeating the same failed validation for unchanged credentials.
@@ -322,6 +348,11 @@ class TokenManager:
                 cooldown = 300 if "PUBLIC_ERROR_UNUSUAL_ACTIVITY" in reason else 60
                 self._validation_retry_after[token_id] = (
                     self.health_identity(token), time.monotonic() + cooldown, reason,
+                )
+                await self._audit(
+                    token_id, "health_check", "cooldown", "validation_backoff",
+                    stage=diagnostic[0], token=token,
+                    details={"cooldown_seconds": cooldown, "retry_reason": account_error_reason(reason)},
                 )
         else:
             self._validation_retry_after.pop(token_id, None)
@@ -417,24 +448,34 @@ class TokenManager:
         return warmup_ids
 
     async def _create_project_for_token(
-        self, token: Token, pool_index: int, base_name: Optional[str] = None
+        self, token: Token, pool_index: int, base_name: Optional[str] = None,
+        *, audit_failure: bool = True,
     ) -> Project:
         """Create a new pooled project for a token and persist it."""
-        project_name = self._build_project_name(pool_index, base_name)
-        project_id = await self._flow_call_for_token(
-            token, lambda: self.flow_client.create_project(
-                token.st, project_name, google_cookies=token.google_cookies,
-            ),
-        )
-        debug_logger.log_info(
-            f"[PROJECT] Created pooled project for token {token.id}: {project_name} ({project_id})"
-        )
-        project = Project(
-            project_id=project_id,
-            token_id=token.id,
-            project_name=project_name,
-        )
-        project.id = await self.db.add_project(project)
+        try:
+            project_name = self._build_project_name(pool_index, base_name)
+            project_id = await self._flow_call_for_token(
+                token, lambda: self.flow_client.create_project(
+                    token.st, project_name, google_cookies=token.google_cookies,
+                ),
+            )
+            debug_logger.log_info(
+                f"[PROJECT] Created pooled project for token {token.id}: {project_name} ({project_id})"
+            )
+            project = Project(
+                project_id=project_id,
+                token_id=token.id,
+                project_name=project_name,
+            )
+            project.id = await self.db.add_project(project)
+        except Exception as error:
+            if audit_failure:
+                await self._audit(
+                    token.id, "project", "failed", "project_creation_failed", stage="project", token=token,
+                    details={"retry_reason": account_error_reason(error)},
+                )
+            raise
+        await self._audit(token.id, "project", "success", "project_created", stage="project", token=token)
         return project
 
     def _select_next_project(self, token: Token, projects: List[Project]) -> Project:
@@ -482,6 +523,7 @@ class TokenManager:
                 project_ids.append(project_id)
 
         await self.db.delete_token(token_id)
+        await self._audit(token_id, "delete", "success", "account_deleted", token=token)
 
         refresh_task = self._refresh_futures.pop(token_id, None)
         if refresh_task and not refresh_task.done():
@@ -515,7 +557,7 @@ class TokenManager:
                     f"[DELETE_TOKEN] 清理 personal 浏览器状态失败: {e}"
                 )
 
-    async def enable_token(self, token_id: int):
+    async def enable_token(self, token_id: int, *, reason: str = "manual_enable"):
         """Enable a token and reset error count"""
         # Enable the token
         await self.db.update_token(
@@ -525,10 +567,12 @@ class TokenManager:
         await self.db.reset_error_count(token_id)
         self._validation_retry_after.pop(token_id, None)
         self._clear_at_validation_cache(token_id)
+        await self._audit(token_id, "enable", "enabled", reason, stage="account_state")
 
-    async def disable_token(self, token_id: int):
+    async def disable_token(self, token_id: int, *, reason: str = "manual_disable", details=None):
         """Disable a token"""
         await self.db.update_token(token_id, is_active=False)
+        await self._audit(token_id, "disable", "disabled", reason, stage="account_state", details=details)
 
     # ========== Token添加 (支持Project创建) ==========
 
@@ -641,6 +685,11 @@ class TokenManager:
                     )
                 )
             except Exception as e:
+                await self._audit(
+                    None, "project", "failed", "project_creation_failed", stage="project",
+                    token={"email": email, "adspower_serial": adspower_serial},
+                    details={"retry_reason": account_error_reason(e)},
+                )
                 raise ValueError(f"创建项目失败：{str(e)}")
 
         token = Token(
@@ -687,6 +736,10 @@ class TokenManager:
 
         debug_logger.log_info(
             f"[ADD_TOKEN] Token added successfully (ID: {token_id}, Email: {email}, pooled_projects={len(pooled_projects)})"
+        )
+        await self._audit(
+            token_id, "create", "success", "account_created", token=token,
+            details={"credits": token.credits, "is_active": token.is_active, "pool_size": len(pooled_projects)},
         )
         return token
 
@@ -811,6 +864,16 @@ class TokenManager:
                 self._clear_at_validation_cache(token_id)
                 self._validation_retry_after.pop(token_id, None)
             await self.db.update_token(token_id, **update_fields)
+            await self._audit(
+                token_id, "update", "success",
+                "credentials_updated" if credential_updated else "account_updated",
+                stage="credentials" if credential_updated else "settings",
+                details={"field_count": len(update_fields), "credential_changed": credential_updated},
+            )
+            if update_fields.get("is_active") is True and token and not token.is_active:
+                await self._audit(
+                    token_id, "enable", "enabled", "credentials_updated", stage="account_state",
+                )
             if credential_updated:
                 # 凭证刚被更新，旧的失败原因不再适用
                 await self._persist_health(token_id, None)
@@ -860,6 +923,17 @@ class TokenManager:
         return self._should_refresh_at(token)
 
     async def ensure_valid_token(self, token: Optional[Token]) -> Optional[Token]:
+        if token is None:
+            return None
+        if self.account_admission is None:
+            return await self._ensure_valid_token_admitted(token)
+        try:
+            with self.account_admission.generation(token.id):
+                return await self._ensure_valid_token_admitted(token)
+        except AccountAdmissionBusy:
+            return None
+
+    async def _ensure_valid_token_admitted(self, token: Optional[Token]) -> Optional[Token]:
         """确保 token 的 AT 可用，并在必要时返回刷新后的最新对象。"""
         if not token:
             return None
@@ -893,6 +967,10 @@ class TokenManager:
                 await self._persist_health(token.id, None)
                 self._last_at_refresh_error.pop(token.id, None)
                 self._mark_at_valid(token.id, proxy_url=token.proxy_url, token=token)
+                await self._audit(
+                    token.id, "health_check", "success", "credentials_validated",
+                    stage="AT_CHECK", token=token, details={"credits": credits_result.get("credits", 0)},
+                )
                 return await self.db.get_token(token.id) or token
             except Exception as e:
                 await self._record_at_failure(
@@ -951,6 +1029,9 @@ class TokenManager:
             diagnostic = self._last_health_diagnostic.get(token_id)
             if diagnostic:
                 self._log_health_diagnostic(diagnostic, "recover")
+            await self._audit(
+                token_id, "refresh_at", "started", "refresh_started", stage="recovery", token=token,
+            )
             new_st = await self._try_refresh_st(token_id, token)
             if new_st:
                 debug_logger.log_info(
@@ -974,7 +1055,7 @@ class TokenManager:
             debug_logger.log_error(
                 f"[AT_REFRESH] Token {token_id}: credentials rejected after recovery, disabling token"
             )
-            await self.disable_token(token_id)
+            await self.disable_token(token_id, reason="authentication_failed")
             diagnostic = self._last_health_diagnostic.get(token_id)
             if diagnostic:
                 self._log_health_diagnostic(diagnostic, "disabled")
@@ -989,7 +1070,17 @@ class TokenManager:
 
         async def runner() -> bool:
             try:
-                return await self._refresh_at_inner(token_id)
+                await self._audit(token_id, "refresh_at", "started", "refresh_started", stage="validation")
+                refreshed = await self._refresh_at_inner(token_id)
+                await self._audit(
+                    token_id, "refresh_at", "success" if refreshed else "failed",
+                    "credentials_validated" if refreshed else account_error_reason(self._last_at_refresh_error.get(token_id)),
+                    stage="result",
+                )
+                return refreshed
+            except Exception as error:
+                await self._audit(token_id, "refresh_at", "failed", account_error_reason(error), stage="result")
+                raise
             finally:
                 current = self._refresh_futures.get(token_id)
                 if current is task:
@@ -1059,6 +1150,10 @@ class TokenManager:
                 )
                 self._last_at_refresh_error.pop(token_id, None)
                 record_token_refresh("at", "success")
+                await self._audit(
+                    token_id, "refresh_at", "success", "credentials_validated", stage="AT_VERIFY",
+                    token=token, details={"credits": credits_result.get("credits", 0)},
+                )
                 return True
             except Exception as verify_err:
                 await self._record_at_failure(
@@ -1075,7 +1170,7 @@ class TokenManager:
             return False
 
     async def _try_protocol_refresh_st(
-        self, token_id: int, token: Token
+        self, token_id: int, token: Token, *, source: str = "system",
     ) -> Optional[str]:
         if (
             self._normalize_protocol_mode(getattr(token, "protocol_mode", "session"))
@@ -1114,6 +1209,7 @@ class TokenManager:
                         )
 
             debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: 尝试协议刷新 ST...")
+            await self._audit(token_id, "refresh_st", "started", "refresh_started", stage="page_probe", source=source, token=token)
             login_result = await protocol_loginer.login(
                 token.google_cookies,
                 proxy=proxy_url or None,
@@ -1133,6 +1229,10 @@ class TokenManager:
                     f"[ST_REFRESH] Token {token_id}: 协议刷新 ST 成功"
                 )
                 record_token_refresh("st", "success")
+                await self._audit(
+                    token_id, "refresh_st", "success", "frontend_probe_passed", stage="page_probe", token=token,
+                    source=source, details={"category": "protocol_probe", "cookie_changed": False},
+                )
                 return new_st
 
             error = self._safe_health_error("ST_REFRESH", login_result.get("error"))
@@ -1140,6 +1240,7 @@ class TokenManager:
                 self._health_diagnostic("ST_REFRESH", login_result.get("error")), "recovery_failed"
             )
             self._last_st_refresh_error[token_id] = error
+            await self._audit(token_id, "refresh_st", "failed", account_error_reason(error), stage="page_probe", source=source, token=token)
             if not self._is_authentication_failure(error):
                 self._protocol_retry_after[token_id] = (
                     retry_key, time.monotonic() + 60, error
@@ -1158,6 +1259,7 @@ class TokenManager:
             error = self._safe_health_error("ST_REFRESH", e)
             self._log_health_diagnostic(self._health_diagnostic("ST_REFRESH", e), "recovery_failed")
             self._last_st_refresh_error[token_id] = error
+            await self._audit(token_id, "refresh_st", "failed", account_error_reason(error), stage="page_probe", source=source, token=token)
             if not self._is_authentication_failure(error):
                 self._protocol_retry_after[token_id] = (
                     retry_key, time.monotonic() + 60, error
@@ -1185,6 +1287,7 @@ class TokenManager:
         Returns:
             新的 ST 字符串，如果失败返回 None
         """
+        browser_attempt_started = False
         try:
             from ..core.config import config
 
@@ -1211,6 +1314,10 @@ class TokenManager:
             debug_logger.log_info(
                 f"[ST_REFRESH] Token {token_id}: 尝试通过浏览器刷新 ST..."
             )
+            browser_attempt_started = True
+            await self._audit(
+                token_id, "refresh_st", "started", "refresh_started", stage="ST_REFRESH", token=token,
+            )
 
             from .browser_captcha_personal import BrowserCaptchaService
 
@@ -1230,6 +1337,9 @@ class TokenManager:
                     f"[ST_REFRESH] Token {token_id}: 刷新 ST 超时 ({refresh_timeout_seconds:.0f}s)"
                 )
                 record_token_refresh("st", "failure")
+                await self._audit(
+                    token_id, "refresh_st", "failed", "timeout", stage="ST_REFRESH", token=token,
+                )
                 return None
             if new_st and new_st != token.st:
                 self._last_st_refresh_error.pop(token_id, None)
@@ -1237,12 +1347,20 @@ class TokenManager:
                 await self.db.update_token(token_id, st=new_st)
                 debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: ST 已自动更新")
                 record_token_refresh("st", "success")
+                await self._audit(
+                    token_id, "refresh_st", "success", "browser_session_refreshed", stage="ST_REFRESH", token=token,
+                    details={"credential_changed": True},
+                )
                 return new_st
             elif new_st == token.st:
                 debug_logger.log_warning(
                     f"[ST_REFRESH] Token {token_id}: 获取到的 ST 与原 ST 相同，可能登录已失效"
                 )
                 record_token_refresh("st", "failure")
+                await self._audit(
+                    token_id, "refresh_st", "failed", "session_token_unchanged", stage="ST_REFRESH", token=token,
+                    details={"credential_changed": False},
+                )
                 return None
             else:
                 self._last_st_refresh_error[token_id] = self._safe_health_error(
@@ -1252,8 +1370,17 @@ class TokenManager:
                     f"[ST_REFRESH] Token {token_id}: 无法获取新 ST"
                 )
                 record_token_refresh("st", "failure")
+                await self._audit(
+                    token_id, "refresh_st", "failed", "session_token_unavailable", stage="ST_REFRESH", token=token,
+                )
                 return None
 
+        except asyncio.CancelledError:
+            if browser_attempt_started:
+                await self._audit(
+                    token_id, "refresh_st", "failed", "operation_cancelled", stage="ST_REFRESH", token=token,
+                )
+            raise
         except Exception as e:
             reason = self._safe_health_error("ST_REFRESH", e)
             self._last_st_refresh_error[token_id] = reason
@@ -1261,6 +1388,10 @@ class TokenManager:
                 f"[ST_REFRESH] Token {token_id}: {reason}"
             )
             record_token_refresh("st", "failure")
+            if browser_attempt_started:
+                await self._audit(
+                    token_id, "refresh_st", "failed", account_error_reason(reason), stage="ST_REFRESH", token=token,
+                )
             return None
 
     async def _refresh_protocol_token(self, token: Token, now: datetime) -> None:
@@ -1281,8 +1412,17 @@ class TokenManager:
             if not (latest.google_cookies or "").strip():
                 return
 
-            new_st = await self._try_protocol_refresh_st(token_id, latest)
+            await self._audit(
+                token_id, "protocol_refresh", "started", "refresh_started", stage="PROTOCOL_REFRESH",
+                source="protocol_refresh", token=latest,
+            )
+            new_st = await self._try_protocol_refresh_st(token_id, latest, source="protocol_refresh")
             if not new_st:
+                await self._audit(
+                    token_id, "protocol_refresh", "failed", "protocol_refresh_failed", stage="PROTOCOL_REFRESH",
+                    source="protocol_refresh", token=latest,
+                    details={"retry_reason": account_error_reason(self._last_st_refresh_error.get(token_id))},
+                )
                 return
 
             self._clear_at_validation_cache(token_id)
@@ -1312,6 +1452,10 @@ class TokenManager:
                 updates["user_paygate_tier"] = credits_result.get("userPaygateTier")
 
                 await self.db.update_token(token_id, **updates)
+                await self._audit(
+                    token_id, "protocol_refresh", "success", "credentials_validated", stage="PROTOCOL_REFRESH",
+                    source="protocol_refresh", details={"credits": updates["credits"]},
+                )
                 await self._persist_health(token_id, None)
                 self._mark_at_valid(
                     token_id, proxy_url=latest.proxy_url,
@@ -1334,6 +1478,10 @@ class TokenManager:
                     last_st_refresh_at=now,
                     last_st_refresh_result=reason,
                 )
+                await self._audit(
+                    token_id, "protocol_refresh", "failed", account_error_reason(reason),
+                    stage="PROTOCOL_REFRESH", source="protocol_refresh", token=latest,
+                )
                 record_token_refresh("at", "failure")
                 debug_logger.log_error(
                     f"[PROTOCOL_REFRESH] Token {token_id}: {reason}"
@@ -1345,6 +1493,10 @@ class TokenManager:
             refresh_config = await self.db.get_token_refresh_config()
         except Exception as e:
             debug_logger.log_warning(f"[PROTOCOL_REFRESH] 读取刷新配置失败: {e}")
+            await self._audit(
+                None, "protocol_refresh", "failed", "protocol_refresh_failed", stage="settings",
+                source="protocol_refresh", details={"retry_reason": account_error_reason(e)},
+            )
             return
 
         if not refresh_config or not refresh_config.enabled:
@@ -1373,8 +1525,17 @@ class TokenManager:
                 ):
                     continue
 
-                await self._refresh_protocol_token(token, now)
+                context = account_operation_source.set("protocol_refresh")
+                try:
+                    await self._refresh_protocol_token(token, now)
+                finally:
+                    account_operation_source.reset(context)
             except Exception as e:
+                await self._audit(
+                    token.id, "protocol_refresh", "failed", "protocol_refresh_failed", stage="PROTOCOL_REFRESH",
+                    source="protocol_refresh", token=token,
+                    details={"retry_reason": account_error_reason(e)},
+                )
                 debug_logger.log_error(
                     f"[PROTOCOL_REFRESH] Token {getattr(token, 'id', '?')}: 后台刷新异常 - {e}"
                 )
@@ -1421,18 +1582,25 @@ class TokenManager:
             if not token:
                 raise ValueError("Token not found")
 
-            projects = [
-                project
-                for project in await self.db.get_projects_by_token(token_id)
-                if project.is_active
-            ]
-            projects = self._sort_projects(projects)
+            try:
+                projects = [
+                    project
+                    for project in await self.db.get_projects_by_token(token_id)
+                    if project.is_active
+                ]
+                projects = self._sort_projects(projects)
+            except Exception as error:
+                await self._audit(
+                    token_id, "project", "failed", "project_creation_failed", stage="project", token=token,
+                    details={"retry_reason": account_error_reason(error)},
+                )
+                raise
 
             try:
                 project_pool_size = self._get_project_pool_size()
                 while len(projects) < project_pool_size:
                     new_project = await self._create_project_for_token(
-                        token, len(projects) + 1
+                        token, len(projects) + 1, audit_failure=False,
                     )
                     projects.append(new_project)
                     projects = self._sort_projects(projects)
@@ -1444,8 +1612,13 @@ class TokenManager:
                     current_project_id=selected_project.project_id,
                     current_project_name=selected_project.project_name,
                 )
+                await self._audit(token_id, "project", "success", "project_selected", stage="project")
                 return selected_project.project_id
             except Exception as e:
+                await self._audit(
+                    token_id, "project", "failed", "project_creation_failed", stage="project", token=token,
+                    details={"retry_reason": account_error_reason(e)},
+                )
                 raise ValueError(f"Failed to prepare project pool: {str(e)}")
 
     async def record_usage(self, token_id: int, is_video: bool = False):
@@ -1464,13 +1637,21 @@ class TokenManager:
         # Check if should auto-disable token (based on consecutive errors)
         stats = await self.db.get_token_stats(token_id)
         admin_config = await self.db.get_admin_config()
+        await self._audit(
+            token_id, "generation", "failed", "operation_failed", source="generation",
+            details={"consecutive_error_count": stats.consecutive_error_count if stats else 0,
+                     "threshold": admin_config.error_ban_threshold},
+        )
 
         if stats and stats.consecutive_error_count >= admin_config.error_ban_threshold:
             debug_logger.log_warning(
                 f"[TOKEN_BAN] Token {token_id} consecutive error count ({stats.consecutive_error_count}) "
                 f"reached threshold ({admin_config.error_ban_threshold}), auto-disabling"
             )
-            await self.disable_token(token_id)
+            await self.disable_token(
+                token_id, reason="consecutive_errors",
+                details={"consecutive_error_count": stats.consecutive_error_count, "threshold": admin_config.error_ban_threshold},
+            )
 
     async def record_success(self, token_id: int):
         """Record successful request (reset consecutive error count)
@@ -1479,6 +1660,7 @@ class TokenManager:
         Note: today_error_count and historical statistics are NOT reset.
         """
         await self.db.reset_error_count(token_id)
+        await self._audit(token_id, "generation", "success", "completed", source="generation")
 
     async def ban_token_for_429(self, token_id: int):
         """因429错误立即禁用token
@@ -1495,6 +1677,7 @@ class TokenManager:
             ban_reason="429_rate_limit",
             banned_at=datetime.now(timezone.utc),
         )
+        await self._audit(token_id, "disable", "disabled", "rate_limit", stage="account_state")
 
     async def auto_unban_429_tokens(self):
         """自动解禁因429被禁用的token
@@ -1553,6 +1736,9 @@ class TokenManager:
                 )
                 # 重置错误计数
                 await self.db.reset_error_count(token.id)
+                await self._audit(
+                    token.id, "enable", "enabled", "cooldown_elapsed", stage="account_state", source="scheduler", token=token,
+                )
 
     # ========== 余额刷新 ==========
 
@@ -1597,4 +1783,8 @@ class TokenManager:
             user_paygate_tier=result.get("userPaygateTier"),
         )
         await self._persist_health(token_id, None)
+        await self._audit(
+            token_id, "refresh_credits", "success", "balance_refreshed", stage="credits", token=valid,
+            details={"credits": credits},
+        )
         return credits

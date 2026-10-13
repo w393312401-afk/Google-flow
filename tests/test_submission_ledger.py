@@ -9,7 +9,9 @@ from unittest.mock import AsyncMock
 
 from src.core.database import Database
 from src.services.flow_frontend import FlowFrontendMixin, FlowRPCRejected
+from src.services.flow_client import FlowClient
 from src.services.submission_ledger import SubmissionLedger
+from src.services.token_manager import TokenManager
 from src.api import routes
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -26,6 +28,15 @@ class SubmissionLedgerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.tmp.cleanup()
 
+    def handler(self, client):
+        # Use the production contextvar route implementation even for offline
+        # HTTP fixtures. Missing runtime dependencies must not bypass routing.
+        if not isinstance(client, FlowClient):
+            context = FlowClient(None)
+            client.get_request_fingerprint = context.get_request_fingerprint
+            client._set_request_fingerprint = context._set_request_fingerprint
+        return SimpleNamespace(flow_client=client, token_manager=TokenManager(self.db, client))
+
     async def test_atomic_reservation_prevents_concurrent_and_restart_duplicates(self):
         result = await asyncio.gather(*(self.ledger.reserve(self.sid, 'same') for _ in range(8)))
         self.assertEqual(sum(created for created, _ in result), 1)
@@ -34,7 +45,7 @@ class SubmissionLedgerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await restarted.reserve(self.sid, 'different'), (False, False))
 
     async def test_unknown_and_missing_receipts_remain_unresolved(self):
-        handler = SimpleNamespace(flow_client=SimpleNamespace(check_video_status=AsyncMock()))
+        handler = self.handler(SimpleNamespace(check_video_status=AsyncMock()))
         missing = await self.ledger.observe(self.sid, handler)
         self.assertTrue(missing['submission_pending'])
         self.assertIsNone(missing['upstream_accepted'])
@@ -56,7 +67,7 @@ class SubmissionLedgerTests(unittest.IsolatedAsyncioTestCase):
             _find_flow_content_url=lambda *_: 'https://flow-content.google/video/original',
             generate_video=AsyncMock(),
         )
-        recovered = await self.ledger.observe(self.sid, SimpleNamespace(flow_client=client))
+        recovered = await self.ledger.observe(self.sid, self.handler(client))
         self.assertEqual(recovered['state'], 'confirmed')
         self.assertFalse(recovered['submission_pending'])
         self.assertEqual(recovered['operation_id'], 'original')
@@ -68,7 +79,7 @@ class SubmissionLedgerTests(unittest.IsolatedAsyncioTestCase):
         await self.ledger.accepted(self.sid, 2, 'project', [{'name': 'original'}])
         self.db.get_token = AsyncMock(return_value=SimpleNamespace(id=2, at='fixture', google_cookies='fixture'))
         client = SimpleNamespace(check_video_status=AsyncMock(side_effect=RuntimeError('401')))
-        result = await self.ledger.observe(self.sid, SimpleNamespace(flow_client=client))
+        result = await self.ledger.observe(self.sid, self.handler(client))
         self.assertEqual(result['state'], 'pending')
         self.assertTrue(result['upstream_accepted'])
         self.assertEqual(result['error']['reason'], 'poll_auth_failed')
@@ -104,9 +115,72 @@ class SubmissionLedgerTests(unittest.IsolatedAsyncioTestCase):
             check_video_status=AsyncMock(return_value={'operations': [{'name': 'other', 'status': 'MEDIA_GENERATION_STATUS_SUCCESSFUL'}]}),
             _find_flow_content_url=lambda *_: 'https://example.test/other.mp4',
         )
-        result = await self.ledger.observe(self.sid, SimpleNamespace(flow_client=client))
+        result = await self.ledger.observe(self.sid, self.handler(client))
         self.assertEqual(result['state'], 'pending')
         self.assertNotIn('video_url', result)
+
+    async def test_mixed_response_cannot_use_another_operation_or_top_level_video_url(self):
+        await self.ledger.reserve(self.sid, 'same')
+        await self.ledger.accepted(self.sid, 2, 'project', [{'name': 'original'}])
+        self.db.get_token = AsyncMock(return_value=SimpleNamespace(id=2, at='fixture', google_cookies='fixture'))
+        client = FlowClient(None)
+        client.check_video_status = AsyncMock(return_value={
+            'operations': [
+                {'name': 'original', 'status': 'MEDIA_GENERATION_STATUS_SUCCESSFUL'},
+                {'name': 'other', 'status': 'MEDIA_GENERATION_STATUS_SUCCESSFUL',
+                 'video_url': 'https://offline.test/video/other.mp4'},
+            ],
+            'miscellaneous': {'video_url': 'https://offline.test/video/unrelated.mp4'},
+        })
+        client.generate_video_text = AsyncMock()
+        result = await self.ledger.observe(self.sid, self.handler(client))
+        self.assertEqual(result['state'], 'pending')
+        self.assertNotIn('video_url', result)
+        saved = await self.ledger.get(self.sid)
+        self.assertEqual([operation['name'] for operation in saved['operations']], ['original'])
+        self.assertNotIn('other.mp4', json.dumps(saved))
+        client.generate_video_text.assert_not_awaited()
+
+    async def test_unique_original_operation_in_second_position_recovers_its_own_video(self):
+        await self.ledger.reserve(self.sid, 'same')
+        await self.ledger.accepted(self.sid, 2, 'project', [{'name': 'original'}])
+        self.db.get_token = AsyncMock(return_value=SimpleNamespace(id=2, at='fixture', google_cookies='fixture'))
+        client = FlowClient(None)
+        client.check_video_status = AsyncMock(return_value={
+            'operations': [
+                {'name': 'other', 'status': 'MEDIA_GENERATION_STATUS_SUCCESSFUL',
+                 'video_url': 'https://offline.test/video/other.mp4'},
+                {'name': 'original', 'operation': {'name': 'original', 'metadata': {
+                    'video': {'fifeUrl': 'https://offline.test/video/original.mp4'}}},
+                 'status': 'MEDIA_GENERATION_STATUS_SUCCESSFUL'},
+            ],
+        })
+        client.generate_video_text = AsyncMock()
+        result = await self.ledger.observe(self.sid, self.handler(client))
+        self.assertEqual(result['state'], 'confirmed')
+        self.assertEqual(result['video_url'], 'https://offline.test/video/original.mp4')
+        self.assertEqual(result['operation_id'], 'original')
+        client.generate_video_text.assert_not_awaited()
+
+    async def test_duplicate_or_conflicting_original_operation_identities_remain_unresolved(self):
+        await self.ledger.reserve(self.sid, 'same')
+        await self.ledger.accepted(self.sid, 2, 'project', [{'name': 'original'}])
+        self.db.get_token = AsyncMock(return_value=SimpleNamespace(id=2, at='fixture', google_cookies='fixture'))
+        candidate = {'name': 'original', 'status': 'MEDIA_GENERATION_STATUS_SUCCESSFUL',
+                     'video_url': 'https://offline.test/video/original.mp4'}
+        cases = [[candidate, dict(candidate)],
+                 [dict(candidate, operation={'name': 'other'})]]
+        for operations in cases:
+            with self.subTest(operations=operations):
+                before = await self.ledger.get(self.sid)
+                client = FlowClient(None)
+                client.check_video_status = AsyncMock(return_value={'operations': operations})
+                client.generate_video_text = AsyncMock()
+                result = await self.ledger.observe(self.sid, self.handler(client))
+                self.assertEqual(result['state'], 'pending')
+                self.assertNotIn('video_url', result)
+                self.assertEqual(await self.ledger.get(self.sid), before)
+                client.generate_video_text.assert_not_awaited()
 
     async def test_expired_original_delivery_url_is_refreshed_without_resubmission(self):
         await self.ledger.reserve(self.sid, 'same')
@@ -118,7 +192,7 @@ class SubmissionLedgerTests(unittest.IsolatedAsyncioTestCase):
             check_video_status=AsyncMock(return_value={'operations': [{'name': 'original', 'status': 'MEDIA_GENERATION_STATUS_SUCCESSFUL'}]}),
             _find_flow_content_url=lambda *_: 'https://flow-content.google/video/original?Expires=9999999999',
         )
-        result = await self.ledger.observe(self.sid, SimpleNamespace(flow_client=client))
+        result = await self.ledger.observe(self.sid, self.handler(client))
         self.assertIn('9999999999', result['video_url'])
         client.check_video_status.assert_awaited_once()
 
@@ -128,11 +202,74 @@ class SubmissionLedgerTests(unittest.IsolatedAsyncioTestCase):
         await self.ledger.update(self.sid, state='confirmed', video_url='https://flow-content.google/video/original?Expires=1')
         self.db.get_token = AsyncMock(return_value=SimpleNamespace(id=2, at='fixture', google_cookies='fixture'))
         client = SimpleNamespace(check_video_status=AsyncMock(side_effect=RuntimeError('401')))
-        result = await self.ledger.observe(self.sid, SimpleNamespace(flow_client=client))
+        result = await self.ledger.observe(self.sid, self.handler(client))
         self.assertEqual(result['state'], 'confirmed')
         self.assertFalse(result['submission_pending'])
         self.assertTrue(result['delivery_pending'])
         self.assertIsNone(result['video_url'])
+
+    async def test_parallel_original_observations_keep_each_account_route_and_never_submit(self):
+        other_sid = '77777777-7777-4777-8777-777777777777'
+        await self.ledger.reserve(self.sid, 'original-a')
+        await self.ledger.reserve(other_sid, 'original-b')
+        await self.ledger.accepted(self.sid, 2, 'project-a', [{'name': 'original-a'}])
+        await self.ledger.accepted(other_sid, 3, 'project-b', [{'name': 'original-b'}])
+        # Concurrent recovery also covers refreshing a confirmed expired URL.
+        await self.ledger.update(other_sid, state='confirmed', video_url='https://offline.test/old.mp4?Expires=1')
+        tokens = {token_id: SimpleNamespace(id=token_id, at='fixture', google_cookies='fixture',
+                                          proxy_url=f'http://account-{token_id}.invalid:1234') for token_id in (2, 3)}
+        self.db.get_token = AsyncMock(side_effect=lambda token_id: tokens[token_id])
+        client = FlowClient(None)
+        parent_fingerprint = {'proxy_url': 'http://parent.invalid:1234', 'user_agent': 'parent-fixture'}
+        client._set_request_fingerprint(parent_fingerprint)
+        entered, gate, observed_routes = set(), asyncio.Event(), []
+
+        async def check(_at, operations, *, token_id, google_cookies):
+            expected_route = tokens[token_id].proxy_url
+            self.assertEqual(client.get_request_fingerprint()['proxy_url'], expected_route)
+            entered.add(token_id)
+            if len(entered) == 2:
+                gate.set()
+            await asyncio.wait_for(gate.wait(), 2)
+            await asyncio.sleep(0)
+            observed_routes.append((token_id, client.get_request_fingerprint()['proxy_url']))
+            self.assertEqual(client.get_request_fingerprint()['proxy_url'], expected_route)
+            return {'operations': [{'name': operations[0]['name'], 'status': 'MEDIA_GENERATION_STATUS_SUCCESSFUL',
+                                    'delivery_url': f'https://offline.test/account-{token_id}.mp4'}]}
+
+        client.check_video_status = AsyncMock(side_effect=check)
+        client._find_flow_content_url = lambda checked, _: checked.get('delivery_url')
+        client.generate_video_text = AsyncMock(side_effect=AssertionError('observation must not submit'))
+        handler = self.handler(client)
+        results = await asyncio.gather(self.ledger.observe(self.sid, handler), self.ledger.observe(other_sid, handler))
+        self.assertEqual([result['state'] for result in results], ['confirmed', 'confirmed'])
+        self.assertEqual(set(observed_routes), {(token_id, token.proxy_url) for token_id, token in tokens.items()})
+        self.assertEqual(client.get_request_fingerprint(), parent_fingerprint)
+        client.check_video_status.assert_awaited()
+        client.generate_video_text.assert_not_awaited()
+        self.assertEqual((await self.ledger.get(self.sid))['operations'], [{'name': 'original-a'}])
+        self.assertEqual((await self.ledger.get(other_sid))['operations'], [{'name': 'original-b'}])
+
+    async def test_no_account_override_clears_inherited_route_and_restores_it_on_auth_error(self):
+        await self.ledger.reserve(self.sid, 'original')
+        await self.ledger.accepted(self.sid, 2, 'project', [{'name': 'original'}])
+        self.db.get_token = AsyncMock(return_value=SimpleNamespace(
+            id=2, at='fixture', google_cookies='fixture', proxy_url=''))
+        client = FlowClient(None)
+        parent_fingerprint = {'proxy_url': 'http://other-account.invalid:1234', 'user_agent': 'fixture'}
+        client._set_request_fingerprint(parent_fingerprint)
+
+        async def check(*_args, **_kwargs):
+            self.assertNotIn('proxy_url', client.get_request_fingerprint())
+            raise RuntimeError('401 UNAUTHENTICATED')
+
+        client.check_video_status = AsyncMock(side_effect=check)
+        client.generate_video_text = AsyncMock(side_effect=AssertionError('observation must not submit'))
+        result = await self.ledger.observe(self.sid, self.handler(client))
+        self.assertEqual(result['state'], 'pending')
+        self.assertEqual(result['error']['reason'], 'poll_auth_failed')
+        self.assertEqual(client.get_request_fingerprint(), parent_fingerprint)
+        client.generate_video_text.assert_not_awaited()
 
     async def test_stream_capture_persists_completion_before_yield(self):
         await self.ledger.reserve(self.sid, 'same')

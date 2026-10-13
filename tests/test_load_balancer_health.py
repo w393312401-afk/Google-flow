@@ -22,7 +22,7 @@ TRAFFIC_ERROR = "PUBLIC_ERROR_UNUSUAL_ACTIVITY_TOO_MUCH_TRAFFIC"
 
 
 def unsubmitted_browser_error(stage, reason):
-    """Mirror the native runner's explicit pre-arming submission annotation."""
+    """Mirror the native runner's explicit guarded cleanup evidence of no send."""
     failure = BrowserCaptchaError(stage, reason)
     failure.submission_pending = False
     return failure
@@ -460,6 +460,52 @@ class LoadBalancerHealthTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(reason, await self.balancer.get_unavailable_reason(for_video_generation=True))
                 self.assertTrue((await self.db.get_token(token_id)).is_active)
                 self.balancer.record_generation_success(token_id, for_video_generation=True, token=token)
+
+    async def test_new_native_actionability_failures_back_off_and_route_to_another_account(self):
+        failed_id, alternative_id = await self.add_token(), await self.add_token()
+        token = await self.db.get_token(failed_id)
+        for stage, reason in (
+            ("native_submit", "browser_closed"),
+            ("native_submit", "element_detached"),
+            ("native_submit", "click_intercepted"),
+            ("native_submit", "submit_disabled"),
+            ("native_page_creation", "browser_closed"),
+            ("native_route_registration", "browser_closed"),
+        ):
+            with self.subTest(stage=stage, reason=reason):
+                failure = unsubmitted_browser_error(stage, reason)
+                for delay in (60, 120, 240, 480, 600):
+                    self.assertTrue(await self.balancer.record_generation_failure(
+                        failed_id, failure, for_video_generation=True, token=token,
+                    ))
+                    self.assertIn(f"{delay} 秒", self.balancer.get_generation_cooldown_reason(
+                        token, for_video_generation=True,
+                    ))
+                    self.assertEqual((await self.balancer.select_token(for_video_generation=True)).id, alternative_id)
+                    self.assertIsNone(self.balancer.get_generation_cooldown_reason(token, for_image_generation=True))
+                    self.assertTrue((await self.db.get_token(failed_id)).is_active)
+                    self.monotonic.return_value += delay
+                self.balancer.record_generation_success(failed_id, for_video_generation=True, token=token)
+
+    async def test_new_native_actionability_names_without_no_send_proof_do_not_open_circuit(self):
+        token_id = await self.add_token()
+        token = await self.db.get_token(token_id)
+        for pending in (None, True):
+            for stage, reason in (
+                ("native_submit", "browser_closed"),
+                ("native_submit", "element_detached"),
+                ("native_submit", "click_intercepted"),
+                ("native_submit", "submit_disabled"),
+                ("native_page_creation", "browser_closed"),
+                ("native_route_registration", "browser_closed"),
+            ):
+                with self.subTest(stage=stage, reason=reason, pending=pending):
+                    failure = BrowserCaptchaError(stage, reason)
+                    failure.submission_pending = pending
+                    self.assertFalse(await self.balancer.record_generation_failure(
+                        token_id, failure, for_video_generation=True, token=token,
+                    ))
+        self.assertEqual(self.balancer._generation_cooldowns, {})
 
     async def test_errors_emitted_by_actual_editor_readiness_open_routing_circuit(self):
         token_id = await self.add_token()

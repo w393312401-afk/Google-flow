@@ -182,6 +182,45 @@ class CookiePoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([r['reason'] for r in result['results']], ['generation_busy', 'profile_inactive'])
         self.assertEqual(result['status'], 'partial_failed')
 
+    async def test_account_lock_conflict_is_deferred_and_does_not_stop_other_accounts(self):
+        paths = [self.private(f'{index}.json', {}) for index in range(2)]
+        class Locked(Exception):
+            reason = 'already_running'
+        async def runner(path):
+            self.calls.append(path)
+            if path == paths[0]:
+                raise Locked('PRIVATE')
+            return {'status': 'updated', 'reason': 'sync_complete'}
+
+        result = await pool.run_pool(self.manifest([str(path) for path in paths]), run_once=runner)
+        self.assertEqual(self.calls, paths)
+        self.assertEqual(result['status'], 'ok')
+        self.assertEqual(result['results'][0], {'index': 1, 'status': 'deferred', 'reason': 'already_running'})
+        self.assertEqual(result['counts']['deferred'], 1)
+        self.assertEqual(result['counts']['updated'], 1)
+        self.assertEqual(result['counts']['error'], 0)
+        self.assertNotIn('PRIVATE', json.dumps(result))
+
+    async def test_all_account_locks_are_counted_as_deferred_with_a_successful_cli_exit(self):
+        self.private('one.json', {})
+        class Locked(Exception):
+            reason = 'already_running'
+        async def runner(_):
+            raise Locked('PRIVATE')
+
+        result = await pool.run_pool(self.manifest(['one.json']), run_once=runner)
+        self.assertEqual(result['status'], 'ok')
+        self.assertEqual(result['counts']['deferred'], 1)
+        self.assertEqual(result['counts']['error'], 0)
+        async def saved_result(_):
+            return result
+        output = io.StringIO()
+        with patch.object(pool, 'run_pool', saved_result), \
+             patch('sys.argv', ['pool', '--manifest', 'local/pool.json']), \
+             contextlib.redirect_stdout(output):
+            self.assertEqual(await asyncio.to_thread(pool.main), 0)
+        self.assertEqual(json.loads(output.getvalue())['counts']['deferred'], 1)
+
     async def test_network_backoff_diagnostics_survive_the_pool_summary(self):
         self.private('one.json', {})
         async def runner(_):

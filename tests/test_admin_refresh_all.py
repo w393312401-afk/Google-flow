@@ -9,6 +9,7 @@ from unittest.mock import patch
 from fastapi import HTTPException
 
 from src.api import admin
+from src.core.account_operation_context import account_error_reason
 
 
 def account(token_id, *, active=True, expires=None):
@@ -41,6 +42,9 @@ class FakeManager:
             raise outcome
         if outcome == 'transient':
             self._last_at_refresh_error[token_id] = 'AT_REFRESH: network or proxy unavailable'
+            return False
+        if isinstance(outcome, str) and outcome.startswith(('AT_REFRESH:', 'AT_VERIFY:', 'ST_REFRESH:')):
+            self._last_at_refresh_error[token_id] = outcome
             return False
         if outcome is False:
             self._last_at_refresh_error[token_id] = 'AT_REFRESH: credentials rejected'
@@ -117,6 +121,48 @@ class RefreshAllTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.order, [1])
         self.assertEqual(result['results'][0]['attempts'], 1)
 
+    async def test_temporary_gateway_failures_retry_and_then_continue_to_next_account(self):
+        for status in (502, 503, 504):
+            with self.subTest(status=status):
+                reason = f'AT_REFRESH: upstream unavailable (HTTP {status})'
+                manager = FakeManager([account(1), account(2)], outcomes={1: [reason, True]})
+                self.use(manager)
+
+                result = await admin.refresh_all_tokens(token='admin')
+
+                self.assertEqual(manager.order, [1, 1, 2])
+                self.assertEqual((result['succeeded'], result['failed']), (2, 0))
+                self.assertEqual(result['results'][0]['attempts'], 2)
+                self.assertTrue(manager.accounts[1].is_active)
+
+    async def test_persistent_gateway_failure_has_bounded_retries_and_keeps_account_enabled(self):
+        reason = 'AT_VERIFY: upstream unavailable (HTTP 503)'
+        manager = FakeManager([account(1), account(2)], outcomes={1: [reason] * 10})
+        self.use(manager)
+
+        result = await admin.refresh_all_tokens(token='admin')
+
+        self.assertEqual(manager.order, [1, 1, 1, 2])
+        self.assertEqual((result['succeeded'], result['failed']), (1, 1))
+        self.assertEqual(result['results'][0]['attempts'], 3)
+        self.assertEqual(result['results'][0]['error'], reason)
+        self.assertFalse(result['results'][0]['disabled'])
+        self.assertTrue(manager.accounts[1].is_active)
+
+    async def test_other_http_failures_do_not_retry_or_disable_account(self):
+        for status in (400, 403, 404, 429, 500, 501):
+            with self.subTest(status=status):
+                reason = f'AT_REFRESH: upstream unavailable (HTTP {status})'
+                manager = FakeManager([account(1)], outcomes={1: [reason, True]})
+                self.use(manager)
+
+                result = await admin.refresh_all_tokens(token='admin')
+
+                self.assertEqual(manager.order, [1])
+                self.assertEqual(result['results'][0]['attempts'], 1)
+                self.assertFalse(result['results'][0]['disabled'])
+                self.assertTrue(manager.accounts[1].is_active)
+
     async def test_overlapping_request_is_rejected_and_flag_is_released(self):
         manager = FakeManager([account(1)])
         manager.gate = asyncio.Event()
@@ -180,6 +226,36 @@ class RefreshSingleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(manager.order, [1, 1, 2, 2, 2])
         self.assertIn('网络或代理暂时不可用', caught.exception.detail)
+        self.assertEqual(account_error_reason(caught.exception), 'network_or_proxy_unavailable')
+
+    async def test_single_gateway_failure_is_retried_and_exhaustion_shows_safe_status(self):
+        reason = 'ST_REFRESH: upstream unavailable (HTTP 503)'
+        manager = FakeManager([account(1), account(2)],
+                              outcomes={1: [reason, True], 2: [reason] * 10})
+        self.use(manager)
+
+        self.assertTrue((await admin.refresh_at(1, token='admin'))['success'])
+        with self.assertRaises(HTTPException) as caught:
+            await admin.refresh_at(2, token='admin')
+
+        self.assertEqual(manager.order, [1, 1, 2, 2, 2])
+        self.assertEqual(caught.exception.status_code, 500)
+        self.assertEqual(caught.exception.detail,
+                         'AT刷新失败: 上游服务暂时不可用（HTTP 503），请稍后再试')
+        self.assertTrue(manager.accounts[2].is_active)
+        self.assertEqual(account_error_reason(caught.exception), 'upstream_unavailable')
+
+    async def test_traffic_restriction_is_not_retried_and_keeps_audit_category(self):
+        reason = 'AT_REFRESH: upstream traffic restriction (PUBLIC_ERROR_UNUSUAL_ACTIVITY_TOO_MUCH_TRAFFIC)'
+        manager = FakeManager([account(1)], outcomes={1: [reason, True]})
+        self.use(manager)
+
+        with self.assertRaises(HTTPException) as caught:
+            await admin.refresh_at(1, token='admin')
+
+        self.assertEqual(manager.order, [1])
+        self.assertTrue(manager.accounts[1].is_active)
+        self.assertEqual(account_error_reason(caught.exception), 'traffic_restriction')
 
     async def test_unknown_account_is_404(self):
         self.use(FakeManager([]))
@@ -188,6 +264,20 @@ class RefreshSingleTests(unittest.IsolatedAsyncioTestCase):
             await admin.refresh_at(9, token='admin')
 
         self.assertEqual(caught.exception.status_code, 404)
+
+
+class RefreshFailureReasonTests(unittest.TestCase):
+    def test_sanitized_upstream_http_failures_keep_fixed_audit_category(self):
+        for status in (403, 429, 502, 503, 504):
+            with self.subTest(status=status):
+                self.assertEqual(account_error_reason(
+                    f'AT_VERIFY: upstream unavailable (HTTP {status})'), 'upstream_unavailable')
+
+    def test_upstream_translation_never_includes_free_text_after_status(self):
+        message = admin._translate_health_reason(
+            'AT_REFRESH: upstream unavailable (HTTP 503) SECRET_COOKIE upstream body')
+        self.assertEqual(message, '上游服务暂时不可用（HTTP 503），请稍后再试')
+        self.assertNotIn('SECRET', message)
 
 
 if __name__ == '__main__':

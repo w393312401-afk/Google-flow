@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from pathlib import Path
+from datetime import datetime, timezone
 
 from .core.config import config
 from .core.database import Database
@@ -22,7 +23,7 @@ from .services.load_balancer import LoadBalancer
 from .services.concurrency_manager import ConcurrencyManager
 from .services.generation_handler import GenerationHandler
 from .services.exit_rotation import ExitRotationManager
-from .api import routes, admin
+from .api import routes, admin, account_logs
 
 
 _LOCAL_NO_PROXY_HOSTS = ("127.0.0.1", "localhost", "::1")
@@ -92,6 +93,15 @@ _configure_process_runtime()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # One serving process owns a database. The OS releases this lease on exit,
+    # providing startup reconciliation with proof that old local workers ended.
+    with token_manager.account_admission.service_owner():
+        async with _lifespan_admitted(app):
+            yield
+
+
+@asynccontextmanager
+async def _lifespan_admitted(app: FastAPI):
     """Application lifespan manager"""
     # Startup
     print("=" * 60)
@@ -119,8 +129,15 @@ async def lifespan(app: FastAPI):
         await db.check_and_migrate_db(config_dict)
         print("Database migration check completed.")
 
+    reconciled = await db.reconcile_interrupted_requests(
+        before=datetime.now(timezone.utc), local_workers_stopped=True,
+    )
+    print(f"Previous-process requests reconciled: {reconciled}")
+
     # 启动时统一把数据库配置同步到内存，避免 personal/brower 相关运行时配置遗漏。
     await db.reload_config_to_memory()
+    from .services.account_log_history import import_account_log_history
+    await import_account_log_history(db)
     generation_handler.file_cache.set_timeout(config.cache_timeout)
     cache_cleanup_enabled = await generation_handler.file_cache.refresh_cleanup_task()
     captcha_config = await db.get_captcha_config()
@@ -274,6 +291,7 @@ generation_handler.exit_rotation = exit_rotation
 # Set dependencies
 routes.set_generation_handler(generation_handler)
 admin.set_dependencies(token_manager, proxy_manager, db, concurrency_manager)
+account_logs.set_database(db)
 
 # Create FastAPI app
 app = FastAPI(
@@ -295,6 +313,7 @@ app.add_middleware(
 # Include routers
 app.include_router(routes.router)
 app.include_router(admin.router)
+app.include_router(account_logs.router)
 
 # Static files - serve tmp directory for cached files
 tmp_dir = Path(__file__).parent.parent / "tmp"
@@ -315,8 +334,10 @@ def _static_page_response(file_path: Path) -> FileResponse:
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
+async def index(request: Request):
     """Redirect to login page"""
+    if await admin.is_admin_session_token_valid(admin.get_admin_token_from_cookie(request)):
+        return RedirectResponse(url="/manage", status_code=302)
     login_file = static_path / "login.html"
     if login_file.exists():
         return _static_page_response(login_file)
@@ -326,8 +347,10 @@ async def index():
 
 
 @app.get("/login", response_class=HTMLResponse)
-async def login_page():
+async def login_page(request: Request):
     """Login page"""
+    if await admin.is_admin_session_token_valid(admin.get_admin_token_from_cookie(request)):
+        return RedirectResponse(url="/manage", status_code=302)
     login_file = static_path / "login.html"
     if login_file.exists():
         return _static_page_response(login_file)
@@ -337,7 +360,7 @@ async def login_page():
 @app.get("/manage", response_class=HTMLResponse)
 async def manage_page(request: Request):
     """Management console page"""
-    guard_response = _ensure_admin_page_session(request)
+    guard_response = await _ensure_admin_page_session(request)
     if guard_response is not None:
         return guard_response
     manage_file = static_path / "manage.html"
@@ -349,7 +372,7 @@ async def manage_page(request: Request):
 @app.get("/test", response_class=HTMLResponse)
 async def test_page(request: Request):
     """Model testing page"""
-    guard_response = _ensure_admin_page_session(request)
+    guard_response = await _ensure_admin_page_session(request)
     if guard_response is not None:
         return guard_response
     test_file = static_path / "test.html"
@@ -365,8 +388,8 @@ async def metrics():
     return Response(content=payload, media_type=CONTENT_TYPE_LATEST)
 
 
-def _ensure_admin_page_session(request: Request):
+async def _ensure_admin_page_session(request: Request):
     token = admin.get_admin_token_from_cookie(request)
-    if not admin.is_admin_session_token_valid(token):
+    if not await admin.is_admin_session_token_valid(token):
         return RedirectResponse(url="/login", status_code=302)
     return None
