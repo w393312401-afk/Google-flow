@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlencode, urlparse
 
 from curl_cffi.requests import AsyncSession
+from curl_cffi.const import CurlHttpVersion
+from curl_cffi.requests.exceptions import Timeout as CurlTimeout
 
 from ..core.logger import debug_logger
 from .browser_cookie_utils import (
@@ -28,11 +30,88 @@ class FlowRPCRejected(RuntimeError):
         self.error_code = str(error_code)
 
     @property
+    def video_model_not_found(self):
+        # Read the structured RPC code, never a prefix in an exception message
+        # (e.g. code=503 is not code=5).
+        if (
+            getattr(self, "outcome_unknown", False)
+            or getattr(self, "submission_uncertain", False)
+            or "MODEL_ACCESS_DENIED" in str(self).upper()
+        ):
+            return False
+        return self.rpc_id in {'YhhmEf', 'eb1hJf', 'nprQif'} and self.error_code.strip().upper() in {
+            '5', '[5]', 'NOT_FOUND',
+        }
+
+    @property
     def submission_rejected(self):
-        return self.rpc_id in {'YhhmEf', 'eb1hJf', 'nprQif'} and self.error_code in {
+        return self.video_model_not_found or self.rpc_id in {'YhhmEf', 'eb1hJf', 'nprQif'} and self.error_code in {
             '401', '403', 'UNAUTHENTICATED', 'PERMISSION_DENIED',
             'PUBLIC_ERROR_UNUSUAL_ACTIVITY', 'PUBLIC_ERROR_UNUSUAL_ACTIVITY_TOO_MUCH_TRAFFIC',
         }
+
+
+class FlowFrontendBootstrapError(RuntimeError):
+    """Fixed bootstrap evidence, without retaining redirect URLs or page text."""
+
+    def __init__(self, reason: str, status_code: int):
+        self.reason = reason
+        self.status_code = status_code
+        if reason == "login_redirect":
+            message = "Flow frontend bootstrap redirected to Google sign-in"
+        elif reason == "unexpected_redirect":
+            message = "Flow frontend bootstrap returned an unexpected redirect"
+        else:
+            message = f"Flow frontend bootstrap failed: HTTP {status_code}"
+        super().__init__(message)
+
+
+def is_google_signin_url(url: str) -> bool:
+    """Recognize an actual Google sign-in destination, never body text or lookalikes."""
+    try:
+        parsed = urlparse(str(url))
+        return (
+            parsed.scheme.lower() == "https"
+            and str(parsed.hostname or "").lower() == "accounts.google.com"
+            and re.match(
+                r"^/(?:v[0-9]+/signin|signin|ServiceLogin|AccountChooser|InteractiveLogin)(?:/|$)",
+                parsed.path,
+            ) is not None
+        )
+    except ValueError:
+        return False
+
+
+def flow_page_get_can_retry_http1(error: Exception, page_url: str) -> bool:
+    """Allow one receive-error retry only for an unchanged, trusted Flow GET."""
+    if getattr(error, "code", None) not in {52, 56} or isinstance(error, (TimeoutError, CurlTimeout)):
+        return False
+    try:
+        target = urlparse(page_url)
+        if (target.scheme != "https" or target.hostname != "flow.google.com"
+                or target.username is not None or target.password is not None
+                or target.port not in {None, 443}):
+            return False
+        response = getattr(error, "response", None)
+        for status in (getattr(error, "status_code", None), getattr(response, "status_code", None)):
+            if re.fullmatch(r"[45]\d{2}", str(status or "")):
+                return False
+        response_url = str(getattr(response, "url", "") or "")
+        if response_url:
+            reached = urlparse(response_url)
+            if (reached.scheme != "https" or reached.hostname != "flow.google.com"
+                    or reached.username is not None or reached.password is not None
+                    or reached.port not in {None, 443}):
+                return False
+    except ValueError:
+        return False
+    # Structured response evidence above wins; these fixed markers also keep
+    # legacy exceptions carrying explicit auth/HTTP/timeout evidence out.
+    return re.search(
+        r"\b(?:UNAUTHENTICATED|timed\s+out|timeout)\b|"
+        r"\b(?:HTTP(?:\s+Error)?|status(?:_code)?|code)[\s:=\"']+[45]\d{2}\b",
+        str(error), re.IGNORECASE,
+    ) is None
 
 
 class FlowFrontendMixin:
@@ -121,6 +200,8 @@ class FlowFrontendMixin:
                 if not isinstance(item, list) or len(item) < 3:
                     continue
                 if item[0] == "er":
+                    if item[1] != rpc_id:
+                        continue
                     code = item[5] if len(item) > 5 and item[5] is not None else None
                     if code is None and len(item) > 6:
                         code = item[6]
@@ -758,25 +839,39 @@ class FlowFrontendMixin:
             "Referer": "https://flow.google.com/",
             "User-Agent": self._get_effective_request_user_agent(),
         }
-        async with AsyncSession(trust_env=False) as session:
-            response = await session.get(
-                page_url,
-                headers=headers,
-                proxy=proxy_url,
-                timeout=max(10, min(int(timeout or 30), 30)),
-                impersonate=self._resolve_runtime_impersonate(),
+        request_kwargs = {
+            "headers": headers,
+            "proxy": proxy_url,
+            "timeout": max(10, min(int(timeout or 30), 30)),
+            "impersonate": self._resolve_runtime_impersonate(),
+        }
+        for attempt in range(2):
+            retry = False
+            # A failed response can mutate a session's cookie jar. Start the
+            # fallback with the original explicit Cookie header and empty jar.
+            async with AsyncSession(trust_env=False) as session:
+                try:
+                    response = await session.get(page_url, **request_kwargs)
+                except Exception as error:
+                    if attempt or not flow_page_get_can_retry_http1(error, page_url):
+                        raise
+                    retry = True
+            if not retry:
+                break
+            debug_logger.log_warning(
+                "[FLOW BOOTSTRAP] Connection lost; retrying GET once with HTTP/1.1 on the same route"
             )
-        response_host = str(urlparse(str(response.url)).hostname or "").lower()
-        if response.status_code in {401, 403} or (
-            response_host and response_host != "flow.google.com"
-        ):
-            raise RuntimeError(
-                "Flow 登录认证失败：Google Cookie 已失效、不完整，或登录态被重定向 "
-                f"(code={response.status_code})"
-            )
+            request_kwargs = dict(request_kwargs, http_version=CurlHttpVersion.V1_1)
         if response.status_code >= 400:
-            raise RuntimeError(
-                f"Flow frontend bootstrap failed: HTTP {response.status_code}"
+            # HTTP status takes precedence over a redirect target or page body;
+            # a traffic-control 403 does not prove expired credentials.
+            raise FlowFrontendBootstrapError("http_error", response.status_code)
+        response_url = urlparse(str(response.url))
+        response_host = str(response_url.hostname or "").lower()
+        if response_host and response_host != "flow.google.com":
+            raise FlowFrontendBootstrapError(
+                "login_redirect" if is_google_signin_url(str(response.url)) else "unexpected_redirect",
+                response.status_code,
             )
         if cookie_updates is not None:
             cookie_updates.extend(self._frontend_bootstrap_cookie_updates(response))
@@ -865,6 +960,9 @@ class FlowFrontendMixin:
             return_error_response=True,
             redact_sensitive_logs=True,
             allow_http1_fallback=rpc_id == "nzlxg",
+            # Credits checks must retain HTTP evidence instead of parsing a
+            # gateway/login HTML response into an unclassified missing payload.
+            reject_http_errors=rpc_id in {'nzlxg', 'YhhmEf', 'eb1hJf', 'nprQif'},
         )
         xsrf_match = re.search(r'\["xsrf"\s*,\s*"((?:\\.|[^"\\])*)"', response_text)
         if xsrf_match:
@@ -879,6 +977,7 @@ class FlowFrontendMixin:
                 return_error_response=True,
                 redact_sensitive_logs=True,
                 allow_http1_fallback=rpc_id == "nzlxg",
+                reject_http_errors=rpc_id in {'nzlxg', 'YhhmEf', 'eb1hJf', 'nprQif'},
             )
 
         frames = self._parse_batchexecute_frames(response_text)

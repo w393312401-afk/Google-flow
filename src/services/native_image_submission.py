@@ -243,21 +243,86 @@ _SUBMIT_CONTROL = (
     "button[aria-label='开始生成']:visible, "
     "button[aria-label='開始生成']:visible"
 )
+_INSUFFICIENT_CREDITS_CONTROL = (
+    "flow-prompt-box:has(.ProseMirror) button[aria-label='Insufficient credits warning']"
+)
+
+
+async def _capture_submit_control_state(page) -> dict:
+    """Describe a failed preflight without saving page, prompt or account text."""
+    try:
+        state = await asyncio.wait_for(page.evaluate(r"""creditSelector => {
+            const visible = el => !!(el.getClientRects().length &&
+                getComputedStyle(el).visibility !== 'hidden');
+            const labels = new Map([
+                ['Start generation', 'start_en'], ['开始生成', 'start_zh'],
+                ['開始生成', 'start_zh_tw'], ['Generate', 'generate_en'],
+                ['生成', 'generate_zh'], ['Create', 'create_en'],
+            ]);
+            const known = el => ['Start generation', '开始生成', '開始生成']
+                .includes(el.getAttribute('aria-label'));
+            const editors = [...document.querySelectorAll('.ProseMirror')];
+            const buttons = [...document.querySelectorAll('button')];
+            const iconWords = new Set(['arrow_forward', 'arrow_upward', 'send',
+                'play_arrow', 'auto_awesome', 'close', 'expand_more']);
+            return {
+                editors: editors.length,
+                visible_editors: editors.filter(visible).length,
+                matching_buttons: buttons.filter(known).length,
+                visible_matching_buttons: buttons.filter(el => known(el) && visible(el)).length,
+                overlays: [...document.querySelectorAll('.cdk-overlay-backdrop, [role="dialog"]')]
+                    .filter(visible).length,
+                project_not_found: /\bProject not found\.?\b/i.test(document.body?.innerText || ''),
+                insufficient_credits: [...document.querySelectorAll(creditSelector)].some(visible),
+                buttons: buttons.filter(visible).slice(0, 40).map(el => {
+                    const aria = el.getAttribute('aria-label');
+                    const icons = [...el.querySelectorAll('mat-icon, .google-symbols, .material-icons, .material-symbols-outlined')]
+                        .map(icon => (icon.textContent || '').trim()).filter(word => iconWords.has(word));
+                    return {
+                        label: labels.get(aria) || (aria ? 'other' : 'absent'),
+                        label_length: Math.min(999, (aria || '').length),
+                        text_length: Math.min(999, (el.innerText || '').length),
+                        disabled: !!el.disabled,
+                        icons: [...new Set(icons)].slice(0, 5),
+                    };
+                }),
+            };
+        }""", _INSUFFICIENT_CREDITS_CONTROL), timeout=2)
+        return state if isinstance(state, dict) else {}
+    except Exception:
+        return {}
+
+
+async def _submit_control_failure(page, reason, error):
+    await _ensure_generation_credit_available(page)
+    failure = _browser_failure("native_submit_prepare", reason, error)
+    failure.native_submit_control_state = await _capture_submit_control_state(page)
+    return failure
+
+
+async def _ensure_generation_credit_available(page):
+    """Recognize the composer's fixed credit warning without opening billing UI."""
+    warning = page.locator(_INSUFFICIENT_CREDITS_CONTROL).first
+    if await warning.is_visible():
+        failure = BrowserCaptchaError("native_submit_prepare", "insufficient_credits")
+        failure.native_submit_control_state = {"insufficient_credits": True}
+        raise failure
 
 
 async def _prepare_submit_control(page):
     """Prove the localized submit control is actionable before arming the guard."""
+    await _ensure_generation_credit_available(page)
     control = page.locator(_SUBMIT_CONTROL).first
     try:
         await control.wait_for(state="visible", timeout=8000)
     except Exception as error:
-        raise _browser_failure("native_submit_prepare", "submit_control_missing", error) from None
+        raise await _submit_control_failure(page, "submit_control_missing", error) from None
     try:
         # A trial click waits for enabled state and overlay/layout stability but
         # never dispatches the click. Failure here is still proven unsubmitted.
         await control.click(trial=True, timeout=8000)
     except Exception as error:
-        raise _browser_failure("native_submit_prepare", "submit_control_not_ready", error) from None
+        raise await _submit_control_failure(page, "submit_control_not_ready", error) from None
     return control
 
 
@@ -410,6 +475,10 @@ async def _submit_native_generation(
             model_key=spec.get("model_key") if kind == "VIDEO" else None,
             **setup_options,
         )
+        # The selected model can replace Generate with a credit warning. Detect
+        # that before uploading references or spending time preparing a request.
+        set_stage("native_submit_prepare")
+        await _ensure_generation_credit_available(page)
         set_stage("native_editor_input")
         editor = page.locator(".ProseMirror:visible").first
         await editor.wait_for(timeout=15000)
@@ -520,6 +589,9 @@ async def _submit_native_generation(
                 "page_closed": page_closed, "submit_attempts": submit_attempts,
                 "elapsed_ms": round((time.monotonic() - started_at) * 1000),
             }
+            submit_state = getattr(diagnostic_failure, "native_submit_control_state", None)
+            if submit_state:
+                diagnostic["submit_control_state"] = submit_state
             token_id = getattr(browser, "token_id", None)
             if type(token_id) is int:
                 diagnostic["token_id"] = token_id

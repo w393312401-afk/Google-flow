@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 from curl_cffi import CurlInfo
+from curl_cffi.const import CurlHttpVersion
 from curl_cffi.requests import AsyncSession, Cookies
 from curl_cffi.requests.cookies import CurlMorsel
 
@@ -18,6 +19,7 @@ from .browser_cookie_utils import (
     parse_browser_cookie_payload,
     validate_flow_cookie_storage,
 )
+from .flow_frontend import flow_page_get_can_retry_http1, is_google_signin_url
 
 
 FLOW_BASE = "https://flow.google.com"
@@ -156,41 +158,56 @@ class ProtocolLogin:
             session_kwargs["proxy"] = normalized_proxy
 
         try:
-            async with AsyncSession(**session_kwargs) as session:
-                response = await session.get(
-                    f"{FLOW_BASE}/projects",
-                    headers={
-                        "Referer": f"{FLOW_BASE}/",
-                    },
+            page_url = f"{FLOW_BASE}/projects"
+            request_kwargs = {"headers": {"Referer": f"{FLOW_BASE}/"}}
+            for attempt in range(2):
+                retry = False
+                async with AsyncSession(**session_kwargs) as session:
+                    try:
+                        response = await session.get(page_url, **request_kwargs)
+                    except Exception as error:
+                        if attempt or not flow_page_get_can_retry_http1(error, page_url):
+                            raise
+                        retry = True
+                if not retry:
+                    break
+                debug_logger.log_warning(
+                    "[PROTOCOL_LOGIN] Connection lost; retrying GET once with HTTP/1.1 on the same route"
                 )
-                # The Python session jar only merges updates; a fresh snapshot also
-                # honors cookies deleted by Set-Cookie, including during redirects.
-                refreshed_jar = Cookies()
-                refreshed_jar.update_cookies_from_curl(
-                    [
-                        CurlMorsel.from_curl_format(line)
-                        for line in response.infos[CurlInfo.COOKIELIST]
-                    ]
-                )
-                refreshed_cookies = _export_cookie_jar(
-                    refreshed_jar.jar, google_cookies_raw
-                )
-            response_host = str(urlparse(str(response.url)).hostname or "").lower()
-            if response_host and response_host != "flow.google.com":
-                return {
-                    "success": False,
-                    "error": "Flow Cookie 已失效或不完整，页面已跳转到 Google 登录",
-                }
+                # libcurl can merge Set-Cookie even while raising a receive
+                # error. Rebuild from the original raw input, never that jar.
+                session_kwargs = dict(session_kwargs, cookies=_cookie_jar(google_cookies_raw))
+                request_kwargs = dict(request_kwargs, http_version=CurlHttpVersion.V1_1)
             if response.status_code != 200:
                 return {
                     "success": False,
                     "error": f"Flow Cookie 验证失败: HTTP {response.status_code}",
+                }
+            response_host = str(urlparse(str(response.url)).hostname or "").lower()
+            if response_host and response_host != "flow.google.com":
+                return {
+                    "success": False,
+                    "error": (
+                        "Flow Cookie 已失效或不完整，页面已跳转到 Google 登录"
+                        if is_google_signin_url(str(response.url))
+                        else "upstream validation response invalid"
+                    ),
                 }
             if "boq_labs-ai-sandbox-frontend_" not in (response.text or ""):
                 return {
                     "success": False,
                     "error": "Flow Cookie 验证失败: 未加载当前前端",
                 }
+            # Only a completed Flow frontend response can supply refreshed
+            # cookies. Its full snapshot also honors Set-Cookie deletions.
+            refreshed_jar = Cookies()
+            refreshed_jar.update_cookies_from_curl(
+                [
+                    CurlMorsel.from_curl_format(line)
+                    for line in response.infos[CurlInfo.COOKIELIST]
+                ]
+            )
+            refreshed_cookies = _export_cookie_jar(refreshed_jar.jar, google_cookies_raw)
             validate_flow_cookie_storage(refreshed_cookies)
             account_email = extract_flow_account_email(response.text)
             if not account_email:
@@ -211,8 +228,17 @@ class ProtocolLogin:
                 "google_cookies": refreshed_cookies,
             }
         except Exception as exc:
-            debug_logger.log_error(f"[PROTOCOL_LOGIN] Flow Cookie 验证异常: {exc}")
-            error = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+            status = next((value for value in (
+                getattr(exc, "status_code", None),
+                getattr(getattr(exc, "response", None), "status_code", None),
+            ) if re.fullmatch(r"[45]\d{2}", str(value or ""))), None)
+            if status is not None:
+                # An interrupted HTTP error response still takes precedence
+                # over misleading authentication words in its private text.
+                error = f"Flow Cookie 验证失败: HTTP {status}"
+            else:
+                error = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+            debug_logger.log_error(f"[PROTOCOL_LOGIN] Flow Cookie 验证异常: {type(exc).__name__}")
             return {"success": False, "error": error}
 
 

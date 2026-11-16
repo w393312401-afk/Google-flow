@@ -40,6 +40,12 @@ from .models import (
 )
 
 
+TOKEN_HEALTH_IDENTITY_FIELDS = (
+    "st", "at", "google_cookies", "proxy_url", "captcha_proxy_url",
+    "extension_route_key", "protocol_mode",
+)
+
+
 class Database:
     """SQLite database manager"""
 
@@ -1455,6 +1461,25 @@ class Database:
                 await db.execute(query, params)
                 await db.commit()
 
+    async def update_token_routes_if_health_matches(
+        self, expected: Token, *, proxy_url: str, captcha_proxy_url: str,
+    ) -> bool:
+        """Change routes only while the failed validation identity is current."""
+        predicates = " AND ".join(
+            f"COALESCE({field}, '') = ?" for field in TOKEN_HEALTH_IDENTITY_FIELDS
+        )
+        async with self._connect(write=True) as db:
+            cursor = await db.execute(
+                "UPDATE tokens SET proxy_url = ?, captcha_proxy_url = ? "
+                f"WHERE id = ? AND is_active = 1 AND {predicates}",
+                [proxy_url, captcha_proxy_url, expected.id, *(
+                    str(getattr(expected, field, "") or "")
+                    for field in TOKEN_HEALTH_IDENTITY_FIELDS
+                )],
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
     async def commit_recovered_credentials(
         self, expected: Token, *, google_cookies: str, at: str,
         at_expires: datetime, credits: float, user_paygate_tier: Optional[str] = None,
@@ -1516,8 +1541,80 @@ class Database:
             await db.execute("DELETE FROM tokens WHERE id = ?", (token_id,))
             await db.commit()
 
-    async def set_token_health(self, token_id: int, reason: str):
+    async def commit_token_health_result(
+        self, expected: Token, *, reason: Optional[str], updates: Optional[Dict[str, Any]] = None,
+        preserve_health: bool = False,
+    ) -> bool:
+        """Commit one validation result only while its credentials and route match.
+
+        The account comparison and health/metadata writes share a transaction,
+        including across processes. A late result must never taint a replacement
+        session, clear its failure, or overwrite its validated AT metadata.
+        """
+        updates = updates or {}
+        allowed = {
+            "st", "at", "at_expires", "google_cookies", "credits", "user_paygate_tier",
+            "last_st_refresh_at", "last_st_refresh_result",
+        }
+        if not set(updates).issubset(allowed):
+            raise ValueError("Invalid token validation fields")
+        predicates = " AND ".join(
+            f"COALESCE({field}, '') = ?" for field in TOKEN_HEALTH_IDENTITY_FIELDS
+        )
+        params = [expected.id, *(
+            str(getattr(expected, field, "") or "") for field in TOKEN_HEALTH_IDENTITY_FIELDS
+        )]
+        async with self._connect(write=True) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                f"SELECT id FROM tokens WHERE id = ? AND {predicates}", params,
+            )
+            if await cursor.fetchone() is None:
+                await db.rollback()
+                return False
+            if updates:
+                assignments = ", ".join(f"{key} = ?" for key in updates)
+                await db.execute(
+                    f"UPDATE tokens SET {assignments} WHERE id = ?",
+                    [*updates.values(), expected.id],
+                )
+            if preserve_health:
+                pass
+            elif reason:
+                await db.execute(
+                    """INSERT INTO token_health (token_id, reason, checked_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(token_id) DO UPDATE SET reason = excluded.reason,
+                                                       checked_at = excluded.checked_at""",
+                    (expected.id, reason[:200], datetime.now(timezone.utc)),
+                )
+            else:
+                await db.execute("DELETE FROM token_health WHERE token_id = ?", (expected.id,))
+            await db.commit()
+            return True
+
+    async def disable_token_if_health_matches(self, expected: Token) -> bool:
+        """Never disable replacement credentials because an older recovery failed."""
+        predicates = " AND ".join(
+            f"COALESCE({field}, '') = ?" for field in TOKEN_HEALTH_IDENTITY_FIELDS
+        )
+        async with self._connect(write=True) as db:
+            cursor = await db.execute(
+                f"UPDATE tokens SET is_active = 0 WHERE id = ? AND {predicates}",
+                [expected.id, *(
+                    str(getattr(expected, field, "") or "")
+                    for field in TOKEN_HEALTH_IDENTITY_FIELDS
+                )],
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def set_token_health(self, token_id: int, reason: str, *, expected: Optional[Token] = None):
         """Remember the latest failed validation reason (safe category text only)."""
+        if expected is not None:
+            if expected.id != token_id:
+                raise ValueError("Token health identity mismatch")
+            return await self.commit_token_health_result(expected, reason=reason)
         async with self._connect(write=True) as db:
             await db.execute(
                 """
@@ -1529,6 +1626,7 @@ class Database:
                 (token_id, (reason or "")[:200], datetime.now(timezone.utc)),
             )
             await db.commit()
+            return True
 
     async def clear_token_health(self, token_id: int):
         """Forget the stored failure after a successful validation or new credentials."""
@@ -1578,6 +1676,23 @@ class Database:
             )
             rows = await cursor.fetchall()
             return [Project(**dict(row)) for row in rows]
+
+    async def deactivate_project_for_token(self, token_id: int, project_id: str) -> bool:
+        """Retain an unavailable project's history, changing only its owner's pool."""
+        async with self._connect(write=True) as db:
+            cursor = await db.execute(
+                "UPDATE projects SET is_active = 0 WHERE token_id = ? AND project_id = ?",
+                (token_id, project_id),
+            )
+            owned = cursor.rowcount == 1
+            if owned:
+                await db.execute(
+                    "UPDATE tokens SET current_project_id = NULL, current_project_name = NULL "
+                    "WHERE id = ? AND current_project_id = ?",
+                    (token_id, project_id),
+                )
+            await db.commit()
+            return owned
 
     async def delete_project(self, project_id: str):
         """Delete project"""

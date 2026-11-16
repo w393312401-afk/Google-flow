@@ -1,6 +1,7 @@
 """Public edge checks use temporary credentials and an in-process fake backend."""
 
 import asyncio
+from dataclasses import replace
 import json
 from pathlib import Path
 import sqlite3
@@ -423,6 +424,160 @@ class PublicGatewayTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(b"".join(forwarded_chunks), b"firstsecond")
 
 
+class LocalAdminAuthenticationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.database_path = str(Path(self.directory.name) / "local-admin.db")
+        self.local_username = "local-operator"
+        self.local_password = "local-admin-N4jA8vwK2M5zC6xB1wY3Pa0dQ"
+        with sqlite3.connect(self.database_path) as connection:
+            connection.execute(
+                "CREATE TABLE admin_config (id INTEGER PRIMARY KEY, username TEXT, password TEXT, api_key TEXT)"
+            )
+            connection.execute("INSERT INTO admin_config VALUES (1, ?, ?, ?)",
+                               (self.local_username, self.local_password, BACKEND_KEY))
+        self.settings = GatewaySettings(
+            public_origin="https://flow2api.example.com", api_key=PUBLIC_KEY,
+            admin_username="", admin_password="", admin_auth_mode="local",
+            backend_url="http://127.0.0.1:38000", database_path=self.database_path,
+        )
+        self.seen = []
+        self.backend = FastAPI()
+
+        @self.backend.api_route("/{path:path}", methods=["GET", "POST"])
+        async def fake_backend(request: Request, path: str):
+            body = await request.body()
+            self.seen.append({"path": request.url.path, "headers": dict(request.headers), "body": body})
+            credentials = read_backend_credentials(self.database_path)
+            if request.url.path in {"/api/login", "/api/admin/login"}:
+                if json.loads(body) != {"username": credentials.username, "password": credentials.password}:
+                    return JSONResponse({"detail": "Invalid credentials"}, status_code=401)
+                response = JSONResponse({"success": True, "username": credentials.username, "token": SESSION})
+                response.set_cookie("admin_session", SESSION, httponly=True, samesite="lax")
+                return response
+            if request.url.path in {"/v1/models", "/v1beta/models", "/models"}:
+                if request.headers.get("authorization") != "Bearer " + credentials.api_key:
+                    return JSONResponse({"detail": "Invalid API key"}, status_code=401)
+                return JSONResponse({"data": []})
+            if request.cookies.get("admin_session") != SESSION:
+                return JSONResponse({"detail": "Missing authorization"}, status_code=401)
+            if request.url.path == "/api/admin/config":
+                return JSONResponse({"admin_username": credentials.username, "api_key": credentials.api_key})
+            return JSONResponse({"admin": True})
+
+        self.app = create_app(self.settings, httpx.ASGITransport(app=self.backend))
+        self.lifespan = self.app.router.lifespan_context(self.app)
+        await self.lifespan.__aenter__()
+        self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app),
+                                        base_url=self.settings.public_origin)
+
+    async def asyncTearDown(self):
+        await self.client.aclose()
+        await self.lifespan.__aexit__(None, None, None)
+        self.directory.cleanup()
+
+    async def test_local_credentials_work_on_both_login_aliases_without_static_admin_config(self):
+        for path in ("/api/login", "/api/admin/login"):
+            with self.subTest(path=path):
+                response = await self.client.post(path, json={
+                    "username": self.local_username, "password": self.local_password,
+                })
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["username"], self.local_username)
+                self.assertEqual(response.json()["token"], SESSION)
+                self.assertEqual(json.loads(self.seen[-1]["body"]), {
+                    "username": self.local_username, "password": self.local_password,
+                })
+                self.assertIn("Secure", response.headers["set-cookie"])
+                self.assertIn("HttpOnly", response.headers["set-cookie"])
+
+    async def test_local_mode_rejects_old_independent_password_and_wrong_username_before_upstream(self):
+        for path in ("/api/login", "/api/admin/login"):
+            for username, password in ((self.local_username, PUBLIC_PASSWORD),
+                                       ("wrong-operator", self.local_password),
+                                       ("", "")):
+                with self.subTest(path=path, username=username):
+                    response = await self.client.post(path, json={"username": username, "password": password})
+                    self.assertEqual(response.status_code, 401)
+        self.assertEqual(self.seen, [])
+
+    async def test_local_mode_follows_database_username_and_password_rotation_without_restart(self):
+        old_username, old_password = self.local_username, self.local_password
+        initial = await self.client.post("/api/login", json={"username": old_username, "password": old_password})
+        self.assertEqual(initial.status_code, 200)
+        self.local_username = "rotated-local-operator"
+        self.local_password = "rotated-local-R4e2Az7Kc8P3vX1m9Lb0Wn6Q"
+        with sqlite3.connect(self.database_path) as connection:
+            connection.execute("UPDATE admin_config SET username = ?, password = ? WHERE id = 1",
+                               (self.local_username, self.local_password))
+        self.seen.clear()
+        for username, password in ((old_username, old_password),
+                                   (old_username, self.local_password),
+                                   (self.local_username, old_password)):
+            rejected = await self.client.post("/api/login", json={"username": username, "password": password})
+            self.assertEqual(rejected.status_code, 401)
+        self.assertEqual(self.seen, [])
+        for path in ("/api/login", "/api/admin/login"):
+            response = await self.client.post(path, json={
+                "username": self.local_username, "password": self.local_password,
+            })
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["username"], self.local_username)
+            self.assertEqual(json.loads(self.seen[-1]["body"]), {
+                "username": self.local_username, "password": self.local_password,
+            })
+
+    async def test_local_login_preserves_independent_public_api_key_and_config_display(self):
+        await self.client.post("/api/login", json={
+            "username": self.local_username, "password": self.local_password,
+        })
+        self.seen.clear()
+        for route in ("/v1/models", "/v1beta/models", "/models"):
+            for key in (BACKEND_KEY, self.local_password):
+                rejected = await self.client.get(route, headers={"authorization": "Bearer " + key})
+                self.assertEqual(rejected.status_code, 401)
+            self.assertEqual((await self.client.get(route)).status_code, 401)
+        self.assertEqual(self.seen, [])
+        for route, headers in (("/v1/models", {"authorization": "Bearer " + PUBLIC_KEY}),
+                               ("/v1beta/models", {"x-goog-api-key": PUBLIC_KEY}),
+                               ("/models?key=" + PUBLIC_KEY, {})):
+            response = await self.client.get(route, headers=headers)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(self.seen[-1]["headers"]["authorization"], "Bearer " + BACKEND_KEY)
+        response = await self.client.get("/api/admin/config")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"admin_username": self.local_username, "api_key": PUBLIC_KEY})
+
+    async def test_startup_rejects_public_api_key_equal_to_backend_key_in_both_admin_modes(self):
+        with sqlite3.connect(self.database_path) as connection:
+            connection.execute("UPDATE admin_config SET api_key = ? WHERE id = 1", (PUBLIC_KEY,))
+        for settings in (self.settings, replace(self.settings, admin_auth_mode="independent",
+                                              admin_username="public-operator", admin_password=PUBLIC_PASSWORD)):
+            with self.subTest(mode=settings.admin_auth_mode):
+                app = create_app(settings, httpx.ASGITransport(app=self.backend))
+                with self.assertRaisesRegex(RuntimeError, "requires independent credentials"):
+                    async with app.router.lifespan_context(app):
+                        self.fail("Matching public/backend API keys must prevent startup")
+
+    async def test_independent_mode_still_rejects_same_admin_password_at_startup(self):
+        settings = replace(self.settings, admin_auth_mode="independent",
+                           admin_username=self.local_username, admin_password=self.local_password)
+        app = create_app(settings, httpx.ASGITransport(app=self.backend))
+        with self.assertRaisesRegex(RuntimeError, "requires independent credentials"):
+            async with app.router.lifespan_context(app):
+                self.fail("Independent administrator mode must retain password separation")
+
+    async def test_local_mode_fails_closed_if_database_credentials_disappear(self):
+        with sqlite3.connect(self.database_path) as connection:
+            connection.execute("DELETE FROM admin_config")
+        response = await self.client.post("/api/login", json={
+            "username": self.local_username, "password": self.local_password,
+        })
+        self.assertEqual(response.status_code, 503)
+        self.assertNotIn(self.local_password, response.text)
+        self.assertEqual(self.seen, [])
+
+
 class GatewaySettingsTests(unittest.TestCase):
     def test_invalid_public_secrets_and_nonloopback_upstream_rejected(self):
         base = dict(public_origin="https://flow2api.example.com", api_key=PUBLIC_KEY,
@@ -434,6 +589,12 @@ class GatewaySettingsTests(unittest.TestCase):
                         {"public_origin": "http://flow2api.example.com"}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 GatewaySettings(**(base | changes))
+
+    def test_unknown_administrator_authentication_mode_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported administrator authentication mode"):
+            GatewaySettings(public_origin="https://flow2api.example.com", api_key=PUBLIC_KEY,
+                            admin_username="", admin_password="", admin_auth_mode="unknown",
+                            backend_url="http://127.0.0.1:38000", database_path="/tmp/fake.db")
 
 
 if __name__ == "__main__":

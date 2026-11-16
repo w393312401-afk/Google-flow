@@ -125,6 +125,35 @@ class ProtocolCookieRefreshTests(unittest.IsolatedAsyncioTestCase):
     async def test_login_redirect_is_rejected(self):
         result, _, _ = await self.call_login(url="https://accounts.google.com/signin")
         self.assertFalse(result["success"])
+        manager = TokenManager(types.SimpleNamespace(), types.SimpleNamespace())
+        self.assertEqual(manager._authentication_evidence(result["error"]), "login_redirect")
+
+    async def test_redirected_http_error_retains_status_over_login_url_or_body(self):
+        manager = TokenManager(types.SimpleNamespace(), types.SimpleNamespace())
+        for status in (401, 403, 429, 503):
+            with self.subTest(status=status):
+                result, _, _ = await self.call_login(
+                    url="https://accounts.google.com/v3/signin/identifier?secret=private-value",
+                    page="UNAUTHENTICATED private-value", status=status,
+                )
+                self.assertFalse(result["success"])
+                self.assertEqual(manager._is_authentication_failure(result["error"]), status == 401)
+                self.assertIn(f"HTTP {status}", result["error"])
+                self.assertNotIn("private-value", str(result))
+
+    async def test_unknown_redirect_does_not_claim_expired_google_session(self):
+        manager = TokenManager(types.SimpleNamespace(), types.SimpleNamespace())
+        for url in (
+            "https://proxy.example/login", "https://accounts.google.com.evil.test/signin",
+            "https://accounts.google.com/unknown", "http://accounts.google.com/signin",
+        ):
+            with self.subTest(url=url):
+                result, _, _ = await self.call_login(url=url, page="UNAUTHENTICATED")
+                self.assertFalse(result["success"])
+                self.assertFalse(manager._is_authentication_failure(result["error"]))
+                self.assertEqual(manager._safe_health_error("ST_REFRESH", result["error"]),
+                                 "ST_REFRESH: upstream validation response invalid")
+                self.assertNotIn(url, str(result))
 
     async def test_plain_cookie_header_remains_supported(self):
         jar = _cookie_jar("OSID=session; SID=account")

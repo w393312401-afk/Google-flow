@@ -76,6 +76,21 @@ class NativeVideoSubmissionTests(unittest.IsolatedAsyncioTestCase):
     async def submit(self):
         return await submit_native_video(self.browser, self.context, "project", self.spec, 1)
 
+    async def test_insufficient_credits_prevents_frame_upload_and_generation(self):
+        from tests.test_native_frame_submission import png_bytes
+
+        self.page.insufficient_credits = True
+        self.spec.update(mode="start", model_key="abra_i2v_4s", frame_images=[png_bytes("red")])
+        with patch("src.services.native_video_submission.upload_native_frames", new_callable=AsyncMock) as upload:
+            with self.assertRaises(BrowserCaptchaError) as raised:
+                await self.submit()
+        self.assertEqual(raised.exception.reason, "insufficient_credits")
+        self.assertIs(raised.exception.submission_pending, False)
+        upload.assert_not_awaited()
+        self.assertNotIn("fill", self.page.events)
+        self.assertNotIn("click", self.page.events)
+        self.assertTrue(self.page.closed)
+
     async def test_submission_creates_page_through_browser_factory(self):
         route = self.route_on_submit(video_body(video_argument()))
         self.context.new_page.side_effect = AssertionError("foreground page creation is forbidden")

@@ -1373,16 +1373,23 @@ def _translate_health_reason(reason: str, disabled: bool = False) -> str:
         message = "Google 登录态已失效（Cookie 被拒绝），请在对应 AdsPower 环境重新登录 Google 后同步 Cookie"
         if disabled:
             message += "；该账号已被自动禁用"
-    elif REFRESH_ALL_TRANSIENT_REASON in reason:
+    elif "credential recovery required" in reason:
+        message = "登录凭证需要恢复，请点击红色“刷新凭证”按钮；如仍失败，请在对应 AdsPower 环境重新登录"
+    elif (REFRESH_ALL_TRANSIENT_REASON in reason
+          or REFRESH_ALL_TRANSPORT_REASON in reason):
         message = "网络或代理暂时不可用，请稍后再试或检查该账号的代理"
     elif "traffic restriction" in reason:
         message = "上游流量限制，请稍后再试"
+    elif REFRESH_ALL_INVALID_RESPONSE_REASON in reason:
+        message = "上游余额校验响应异常，请稍后重试或检查该账号的代理"
     elif upstream_status := _refresh_upstream_http_status(reason):
         message = f"上游服务暂时不可用（HTTP {upstream_status}），请稍后再试"
     elif "account disabled" in reason:
         message = "账号已禁用，请先启用后再刷新"
+    elif "account changed during validation" in reason:
+        message = "账号凭证或线路在校验期间发生变化，请重试"
     else:
-        message = reason or "未知错误"
+        message = "上游校验暂时未完成，请稍后再试" if reason else "未知错误"
     return message
 
 
@@ -1390,17 +1397,102 @@ def _describe_refresh_failure(reason: str, disabled: bool) -> str:
     return f"AT刷新失败: {_translate_health_reason(reason, disabled)}"
 
 
-# 代理/网络抖动与网关临时不可用可以重试；认证失败、流量限制等不重试
+# 只读余额校验的网络、服务端和无效响应可以有界重试；认证或限流不重试。
 REFRESH_ALL_TRANSIENT_REASON = "network or proxy unavailable"
-REFRESH_ALL_TRANSIENT_HTTP_STATUSES = {"502", "503", "504"}
+REFRESH_ALL_TRANSPORT_REASON = "upstream transport unavailable"
+REFRESH_ALL_INVALID_RESPONSE_REASON = "upstream validation response invalid"
+REFRESH_ALL_TRANSIENT_HTTP_STATUSES = {"500", "502", "503", "504"}
+REFRESH_PROXY_REPAIR_HTTP_STATUSES = {"502", "503", "504"}
 refresh_all_retry_delays = (2.0, 5.0)
 
 
 def _is_retryable_refresh_failure(reason: str) -> bool:
+    prefix = r"(?:(?:AT_CHECK|AT_VERIFY|AT_REFRESH|ST_REFRESH|PROTOCOL_REFRESH): )?"
     return (
         REFRESH_ALL_TRANSIENT_REASON in reason
+        or re.fullmatch(prefix + re.escape(REFRESH_ALL_TRANSPORT_REASON), reason or "") is not None
+        or re.fullmatch(
+            prefix + re.escape(REFRESH_ALL_INVALID_RESPONSE_REASON), reason or "",
+        ) is not None
         or _refresh_upstream_http_status(reason) in REFRESH_ALL_TRANSIENT_HTTP_STATUSES
     )
+
+
+def _safe_proxy_repair_reason(reason: str) -> Optional[str]:
+    """Return only a fixed transport category that is safe to persist."""
+    prefix = r"(?:(?:AT_CHECK|AT_VERIFY|AT_REFRESH|ST_REFRESH|PROTOCOL_REFRESH): )?"
+    if re.fullmatch(prefix + re.escape(REFRESH_ALL_TRANSIENT_REASON), reason or ""):
+        return REFRESH_ALL_TRANSIENT_REASON
+    if re.fullmatch(prefix + re.escape(REFRESH_ALL_TRANSPORT_REASON), reason or ""):
+        return REFRESH_ALL_TRANSPORT_REASON
+    match = re.fullmatch(prefix + r"upstream unavailable \(HTTP (\d{3})\)", reason or "")
+    if match and match.group(1) in REFRESH_PROXY_REPAIR_HTTP_STATUSES:
+        return f"upstream unavailable (HTTP {match.group(1)})"
+    return None
+
+
+async def _repair_refresh_proxy(
+    token_id: int, safe_reason: str, *, failed_identity: Optional[str] = None,
+) -> str:
+    """Rotate one registered account while holding its maintenance lease."""
+    from ..core.logger import debug_logger
+
+    manager = getattr(token_manager, "exit_rotation", None)
+    admission = getattr(token_manager, "account_admission", None)
+    if manager is None or admission is None:
+        return "not_available"
+    try:
+        if not manager.enabled_for(token_id):
+            return "not_registered"
+    except Exception:
+        debug_logger.log_error(
+            f"[API] AT 刷新代理自愈不可用: token_id={token_id}, stage=registration"
+        )
+        return "failed"
+
+    try:
+        lease = admission.maintenance(token_id)
+    except AccountAdmissionBusy:
+        return "busy"
+    except Exception:
+        debug_logger.log_error(
+            f"[API] AT 刷新代理自愈不可用: token_id={token_id}, stage=admission"
+        )
+        return "failed"
+
+    try:
+        with lease:
+            latest = await token_manager.get_token(token_id)
+            if latest is None or not latest.is_active:
+                return "account_unavailable"
+            if failed_identity is not None and TokenManager.health_identity(latest) != failed_identity:
+                # Another caller already changed this failed route/session.
+                # Revalidate its replacement instead of rotating it again based
+                # on a coalesced refresh result from the old identity.
+                return "repaired"
+            if (failed_identity is not None
+                    and getattr(manager, "accepts_health_error_identity", False)):
+                marked = await manager.mark_health_error(
+                    token_id, safe_reason, failed_identity=failed_identity,
+                )
+            else:
+                marked = await manager.mark_health_error(token_id, safe_reason)
+            if marked is False:
+                return "failed"
+            prepare_admitted = getattr(manager, "prepare_token_under_maintenance", None)
+            if callable(prepare_admitted):
+                await prepare_admitted(latest, lease)
+            else:
+                # Compatibility for older integrations without admission-aware
+                # rotation. The real manager validates the live owner above.
+                await manager.prepare_token(latest)
+        return "repaired"
+    except Exception:
+        # Do not include exception text: it may contain a proxy URL or credentials.
+        debug_logger.log_error(
+            f"[API] AT 刷新代理自愈失败: token_id={token_id}, stage=rotation"
+        )
+        return "failed"
 
 
 async def _refresh_token_for_batch(item) -> Dict[str, Any]:
@@ -1408,25 +1500,79 @@ async def _refresh_token_for_batch(item) -> Dict[str, Any]:
     from ..core.logger import debug_logger
 
     entry: Dict[str, Any] = {"id": item.id, "email": item.email, "success": False}
+    proxy_repair_checked = False
     for attempt in range(len(refresh_all_retry_delays) + 1):
         entry["attempts"] = attempt + 1
+        failed_identity = None
+        consume_outcome = getattr(token_manager, "consume_refresh_outcome", None)
+        has_bound_outcome = callable(consume_outcome)
         try:
-            if await token_manager._refresh_at(item.id):
+            if has_bound_outcome:
+                consume_outcome(item.id)
+            attempted_token = await token_manager.get_token(item.id)
+            if attempted_token is not None and not has_bound_outcome:
+                failed_identity = TokenManager.health_identity(attempted_token)
+            refreshed = await token_manager._refresh_at(item.id)
+            outcome = consume_outcome(item.id) if has_bound_outcome else None
+            if has_bound_outcome:
+                # A coalesced task may have started before this caller read its
+                # snapshot. Only the actual task result identifies its route.
+                failed_identity = outcome.identity if outcome is not None else None
+            if refreshed:
                 updated = await token_manager.get_token(item.id)
+                if updated is None or not updated.is_active:
+                    entry.update(error="AT_REFRESH: account disabled", disabled=True)
+                    return entry
+                if has_bound_outcome and (
+                    outcome is None or not outcome.success
+                    or outcome.identity != TokenManager.health_identity(updated)
+                ):
+                    entry.update(error="AT_REFRESH: account changed during validation", disabled=False)
+                    if attempt >= len(refresh_all_retry_delays):
+                        return entry
+                    # A success for the old session cannot validate the new
+                    # route/session. Spend the next bounded attempt on it.
+                    continue
                 entry["success"] = True
                 entry.pop("error", None)
                 entry.pop("disabled", None)
                 if updated and updated.at_expires:
                     entry["at_expires"] = updated.at_expires.isoformat()
                 return entry
-            reason = token_manager._last_at_refresh_error.get(item.id) or "AT刷新失败"
+            reason = (outcome.reason if outcome is not None else None) or (
+                token_manager._last_at_refresh_error.get(item.id) or "AT刷新失败"
+            )
             current = await token_manager.get_token(item.id)
             entry["error"] = _truncate_text(reason)
             entry["disabled"] = bool(current and not current.is_active)
         except Exception as e:
-            debug_logger.log_error(f"[API] 全部刷新 AT 异常: token_id={item.id}, {e}")
-            entry["error"] = _truncate_text(e)
-            return entry
+            classify = getattr(token_manager, "_safe_health_error", None)
+            reason = (classify("AT_REFRESH", e) if callable(classify)
+                      else "AT_REFRESH: upstream validation unavailable (unclassified error)")
+            debug_logger.log_error(f"[API] 全部刷新 AT 异常: token_id={item.id}, {reason}")
+            entry["error"] = reason
+            try:
+                current = await token_manager.get_token(item.id)
+            except Exception:
+                # Without current account state, return the sanitized failure
+                # instead of retrying or exposing the storage exception.
+                return entry
+            entry["disabled"] = bool(current and not current.is_active)
+        safe_repair_reason = _safe_proxy_repair_reason(reason)
+        if (safe_repair_reason and not proxy_repair_checked and not entry["disabled"]
+                and (not has_bound_outcome or failed_identity is not None)):
+            proxy_repair_checked = True
+            repair_status = await _repair_refresh_proxy(
+                item.id, safe_repair_reason, failed_identity=failed_identity,
+            )
+            if repair_status in {"busy", "account_unavailable"}:
+                return entry
+            if repair_status == "repaired":
+                if attempt >= len(refresh_all_retry_delays):
+                    return entry
+                # The replacement route was already probed; retry outside the
+                # maintenance lease and without an unnecessary backoff delay.
+                continue
         if (
             entry["disabled"]
             or not _is_retryable_refresh_failure(reason)

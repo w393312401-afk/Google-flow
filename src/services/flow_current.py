@@ -17,6 +17,7 @@ from ..core.config import config
 from ..core.logger import debug_logger
 from .browser_cookie_utils import validate_flow_cookie_storage
 from .captcha_errors import BrowserCaptchaError
+from .flow_frontend import FlowRPCRejected
 
 class CurrentFlowClientMixin:
     FRONTEND_ACCESS_TOKEN = "flow-frontend-cookie"
@@ -610,9 +611,24 @@ class CurrentFlowClientMixin:
         if frame_images:
             raise BrowserCaptchaError("native_frame_prepare", "native_mode_required")
         max_retries = max(1, int(self._get_runtime_config().flow_max_retries or 1))
-        last_error: Optional[Exception] = None
-        for retry_attempt in range(max_retries):
+        request_model_key = str(model_key or "").strip()
+        # Keep fallback within the affected Fast model's duration and mode.
+        fast_model_pattern = {
+            "text": r"veo_3_1_t2v_fast_[46]s_relaxed",
+            "start": r"veo_3_1_i2v_s_fast_[46]s_relaxed",
+            "start_end": r"veo_3_1_i2v_s_fast_[46]s_fl_relaxed",
+        }.get(mode)
+        fallback_model_key = (
+            request_model_key.removesuffix("_relaxed")
+            if fast_model_pattern and re.fullmatch(fast_model_pattern, request_model_key)
+            else None
+        )
+        fallback_rejection = None
+        retry_attempt = 0
+        while True:
             browser_id = None
+            rpc_id = None
+            retry_permit = None
             try:
                 token, browser_id = await self._get_recaptcha_token(
                     project_id,
@@ -625,7 +641,7 @@ class CurrentFlowClientMixin:
                 rpc_id, argument = self._build_frontend_video_generation_argument(
                     project_id=project_id,
                     prompt=prompt,
-                    model_key=model_key,
+                    model_key=request_model_key,
                     aspect_ratio=aspect_ratio,
                     recaptcha_token=token,
                     # Protocol requests use an independent session id instead of
@@ -638,33 +654,59 @@ class CurrentFlowClientMixin:
                     video_media_id=video_media_id,
                     resolution=resolution,
                 )
-                payload = await self._current_rpc(
-                    rpc_id=rpc_id,
-                    argument=argument,
-                    google_cookies=google_cookies,
-                    token_id=token_id,
-                    project_id=project_id,
+                rpc_kwargs = dict(
+                    rpc_id=rpc_id, argument=argument, google_cookies=google_cookies,
+                    token_id=token_id, project_id=project_id,
                     timeout=max(self._get_video_submit_timeout(), 90),
                 )
+                if fallback_rejection is None:
+                    payload = await self._current_rpc(**rpc_kwargs)
+                else:
+                    # Never clear the logical request's sent flag or count it
+                    # twice. Only this replacement RPC receives a one-use permit.
+                    with self._allow_rejected_video_model_retry(
+                        fallback_rejection, rpc_id=rpc_id, project_id=project_id,
+                    ) as retry_permit:
+                        payload = await self._current_rpc(**rpc_kwargs)
                 return self._normalize_frontend_video_submission(
                     payload,
                     project_id=project_id,
                     aspect_ratio=aspect_ratio,
-                    model_key=model_key,
+                    model_key=request_model_key,
                     rpc_id=rpc_id,
                 )
             except Exception as error:
-                last_error = error
+                if fallback_rejection is not None:
+                    if retry_permit is None or not retry_permit["used"]:
+                        # Preparation failed before another POST: the original
+                        # explicit refusal remains the ledger's authority.
+                        raise fallback_rejection from error
+                    raise
+                if (
+                    isinstance(error, FlowRPCRejected)
+                    and error.video_model_not_found and error.rpc_id == rpc_id
+                ):
+                    if fallback_model_key is None:
+                        raise
+                    fallback_rejection = error
+                    request_model_key = fallback_model_key
+                    debug_logger.log_warning(
+                        f"[VIDEO] Flow 拒绝短时长 relaxed 模型，回退同一时长标准 key: "
+                        f"{model_key} -> {request_model_key}"
+                    )
+                    # One fallback is independent of the pre-submission retry
+                    # budget, even if the refusal was its final attempt.
+                    continue
                 if self._generation_request_was_sent():
                     raise
                 # MODEL_ACCESS_DENIED 为账号权限拒绝，重试不会改变结果
                 if "MODEL_ACCESS_DENIED" in str(error):
                     raise
-                if retry_attempt >= max_retries - 1:
+                retry_attempt += 1
+                if retry_attempt >= max_retries:
                     raise
             finally:
                 await self._notify_browser_captcha_request_finished(browser_id)
-        raise last_error or RuntimeError("Flow frontend video generation failed")
 
     async def generate_video_text(
         self,

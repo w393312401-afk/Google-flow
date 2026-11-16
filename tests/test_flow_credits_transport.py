@@ -1,3 +1,4 @@
+import builtins
 import json
 import unittest
 from types import SimpleNamespace
@@ -5,10 +6,11 @@ from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs
 
 from curl_cffi.const import CurlHttpVersion
-from curl_cffi.requests.exceptions import ConnectionError, HTTPError
+from curl_cffi.requests.exceptions import ConnectionError, HTTPError, ProxyError, Timeout
 
 from src.services.flow_client import FlowClient
-from src.services.flow_frontend import FlowRPCRejected
+from src.services.flow_frontend import FlowFrontendBootstrapError, FlowRPCRejected
+from src.services.token_manager import TokenManager
 
 
 BOOTSTRAP = (
@@ -55,6 +57,69 @@ class FlowCreditsTransportTests(unittest.IsolatedAsyncioTestCase):
             cookie_header="OSID=test-session; SID=test-account",
             timeout=10,
         )
+
+    async def test_successful_google_login_redirect_has_structured_auth_evidence(self):
+        for path in ("/v3/signin/identifier", "/signin/v2/identifier", "/ServiceLogin", "/AccountChooser"):
+            with self.subTest(path=path):
+                client = FlowClient(SimpleNamespace(get_request_proxy_url=AsyncMock(return_value=None)))
+                session = _Session([SimpleNamespace(
+                    status_code=200, url="https://accounts.google.com" + path + "?private=test-secret",
+                    text="test-secret-page-body",
+                )])
+                with patch("src.services.flow_frontend.AsyncSession", return_value=session):
+                    with self.assertRaises(FlowFrontendBootstrapError) as caught:
+                        await client._load_flow_frontend_bootstrap(
+                            "https://flow.google.com/projects", "OSID=test-secret", 10,
+                        )
+                manager = TokenManager(SimpleNamespace(), client)
+                self.assertEqual(manager._authentication_evidence(caught.exception), "login_redirect")
+                self.assertEqual(manager._safe_health_error("AT_REFRESH", caught.exception),
+                                 "AT_REFRESH: credentials rejected (UNAUTHENTICATED)")
+                self.assertNotIn("test-secret", str(caught.exception))
+                session.get.assert_awaited_once()
+
+    async def test_bootstrap_http_status_overrides_login_target_and_private_body(self):
+        for status in (401, 403, 429, 502, 503, 504):
+            with self.subTest(status=status):
+                client = FlowClient(SimpleNamespace(get_request_proxy_url=AsyncMock(return_value=None)))
+                session = _Session([SimpleNamespace(
+                    status_code=status, url="https://accounts.google.com/v3/signin/identifier",
+                    text="UNAUTHENTICATED HTTP 401 test-secret-body",
+                )])
+                with patch("src.services.flow_frontend.AsyncSession", return_value=session):
+                    with self.assertRaises(FlowFrontendBootstrapError) as caught:
+                        await client._load_flow_frontend_bootstrap(
+                            "https://flow.google.com/projects", "OSID=test-secret", 10,
+                        )
+                manager = TokenManager(SimpleNamespace(), client)
+                self.assertEqual(manager._is_authentication_failure(caught.exception), status == 401)
+                self.assertEqual(manager._safe_health_error("AT_REFRESH", caught.exception), (
+                    "AT_REFRESH: credentials rejected (UNAUTHENTICATED)" if status == 401
+                    else f"AT_REFRESH: upstream unavailable (HTTP {status})"
+                ))
+                self.assertNotIn("test-secret", str(caught.exception))
+
+    async def test_unexpected_bootstrap_redirect_is_not_evidence_of_expired_credentials(self):
+        for target in (
+            "https://accounts.google.com.evil.test/v3/signin/identifier",
+            "https://proxy.example/login?next=https://accounts.google.com/v3/signin/identifier",
+            "http://accounts.google.com/v3/signin/identifier",
+            "https://accounts.google.com/unknown",
+            "https://accounts.google.com/ServiceLoginNotActually",
+        ):
+            with self.subTest(target=target):
+                client = FlowClient(SimpleNamespace(get_request_proxy_url=AsyncMock(return_value=None)))
+                session = _Session([SimpleNamespace(status_code=200, url=target, text="UNAUTHENTICATED")])
+                with patch("src.services.flow_frontend.AsyncSession", return_value=session):
+                    with self.assertRaises(FlowFrontendBootstrapError) as caught:
+                        await client._load_flow_frontend_bootstrap(
+                            "https://flow.google.com/projects", "OSID=test-secret", 10,
+                        )
+                manager = TokenManager(SimpleNamespace(), client)
+                self.assertFalse(manager._is_authentication_failure(caught.exception))
+                self.assertEqual(manager._safe_health_error("AT_REFRESH", caught.exception),
+                                 "AT_REFRESH: upstream validation response invalid")
+                self.assertNotIn(target, str(caught.exception))
 
     async def test_receive_failures_retry_once_with_http1_and_identical_request(self):
         for code in (52, 56):
@@ -132,9 +197,160 @@ class FlowCreditsTransportTests(unittest.IsolatedAsyncioTestCase):
             "HTTP Error 401", code=56, response=SimpleNamespace(status_code=401),
         )])
         with patch("src.services.flow_client.AsyncSession", return_value=session):
-            with self.assertRaisesRegex(Exception, "HTTP Error 401"):
+            with self.assertRaisesRegex(Exception, "HTTP 401"):
                 await self.call_rpc(client)
         session.post.assert_awaited_once()
+
+    async def test_credits_http_status_survives_without_private_body_or_transport_retry(self):
+        for status in (401, 403, 429, 500, 502, 503, 504):
+            with self.subTest(status=status):
+                client = self.client()
+                # Both a valid-looking RPC payload and an XSRF challenge in an
+                # error body must remain an HTTP failure, never success/replay.
+                response = SimpleNamespace(status_code=status, text=(
+                    '<html>test-secret-cookie test-secret-password</html>'
+                    + rpc_response().text + ' [["xsrf","test-secret-xsrf"]]'))
+                session = _Session([response])
+                with patch("src.services.flow_client.AsyncSession", return_value=session), \
+                     patch("src.services.flow_client.debug_logger.log_error") as log_error:
+                    with self.assertRaisesRegex(Exception, f"HTTP {status}") as caught:
+                        await self.call_rpc(client)
+                session.post.assert_awaited_once()
+                self.assertEqual(caught.exception.status_code, status)
+                self.assertNotIn("test-secret", str(caught.exception) + str(log_error.call_args_list))
+                manager = TokenManager(SimpleNamespace(), client)
+                self.assertEqual(manager._is_authentication_failure(caught.exception), status == 401)
+                reason = manager._safe_health_error("AT_REFRESH", caught.exception)
+                self.assertIn("credentials rejected" if status == 401 else f"HTTP {status}", reason)
+                self.assertNotIn("unclassified", reason)
+
+    async def test_structured_transport_http_status_reaches_classifier_without_private_text(self):
+        for status in (401, 403, 500, 503):
+            with self.subTest(status=status):
+                client = self.client()
+                session = _Session([HTTPError(
+                    "UNAUTHENTICATED HTTP 401 test-secret-private-response", code=56,
+                    response=SimpleNamespace(status_code=status),
+                )])
+                with patch("src.services.flow_client.AsyncSession", return_value=session):
+                    with self.assertRaises(Exception) as caught:
+                        await self.call_rpc(client)
+                session.post.assert_awaited_once()
+                failure = caught.exception
+                self.assertEqual(failure.status_code, status)
+                self.assertNotIn("test-secret", str(failure))
+                manager = TokenManager(SimpleNamespace(), client)
+                self.assertEqual(manager._is_authentication_failure(failure), status == 401)
+                self.assertEqual(manager._safe_health_error("AT_REFRESH", failure), (
+                    "AT_REFRESH: credentials rejected (UNAUTHENTICATED)" if status == 401
+                    else f"AT_REFRESH: upstream unavailable (HTTP {status})"
+                ))
+
+    async def test_empty_transport_network_types_survive_real_rpc_boundary(self):
+        for failure in (builtins.TimeoutError(), builtins.ConnectionError(), ConnectionError(""), Timeout(""), ProxyError("")):
+            with self.subTest(error_type=type(failure).__name__):
+                client = self.client()
+                session = _Session([failure])
+                with patch("src.services.flow_client.AsyncSession", return_value=session):
+                    with self.assertRaises((builtins.TimeoutError, builtins.ConnectionError)) as caught:
+                        await self.call_rpc(client)
+                session.post.assert_awaited_once()
+                manager = TokenManager(SimpleNamespace(), client)
+                self.assertFalse(manager._is_authentication_failure(caught.exception))
+                self.assertEqual(manager._safe_health_error("AT_REFRESH", caught.exception),
+                                 "AT_REFRESH: network or proxy unavailable")
+
+    async def test_debug_redaction_covers_proxy_headers_url_body_and_exception(self):
+        for response in (
+            SimpleNamespace(status_code=200, text="test-secret-response"),
+            SimpleNamespace(status_code=503, text="test-secret-response"),
+            ConnectionError("test-secret-exception", code=56),
+        ):
+            with self.subTest(outcome_type=type(response).__name__, status=getattr(response, "status_code", None)):
+                client = self.client()
+                client._set_request_fingerprint({"proxy_url": PROXY, "user_agent": "test-secret-user-agent"})
+                session = _Session([response])
+                with patch("src.services.flow_client.AsyncSession", return_value=session), \
+                     patch("src.services.flow_client.config", SimpleNamespace(debug_enabled=True)), \
+                     patch("src.services.flow_client.debug_logger") as logger:
+                    try:
+                        await client._make_text_request(
+                            method="POST", url=RPC_URL + "?rpcids=nzlxg&private=test-secret-query",
+                            headers={"Cookie": "test-secret-cookie"}, raw_body="test-secret-request-body",
+                            redact_sensitive_logs=True,
+                        )
+                    except Exception as failure:
+                        self.assertNotIn("test-secret", str(failure))
+                    logs = str(logger.mock_calls)
+                    for private in ("test-secret", "test-password", "test-user", "proxy.example", PROXY):
+                        self.assertNotIn(private, logs)
+                    logger.log_request.assert_called_once()
+                    self.assertEqual(logger.log_request.call_args.kwargs["url"], "<redacted>")
+                    self.assertIsNone(logger.log_request.call_args.kwargs["proxy"])
+                # Redaction affects observation only, preserving the actual route
+                # and authenticated request that the transport receives.
+                session.post.assert_awaited_once()
+                self.assertEqual(session.post.await_args.kwargs["proxy"], PROXY)
+                self.assertEqual(session.post.await_args.kwargs["headers"]["Cookie"], "test-secret-cookie")
+                self.assertEqual(session.post.await_args.kwargs["data"], "test-secret-request-body")
+
+    async def test_sanitized_generation_failure_keeps_sent_guard_and_never_replays(self):
+        client = self.client()
+        observer = AsyncMock()
+        client.set_generation_sent_callback(observer)
+        failure = ConnectionError("test-secret-private-transport-error", code=56)
+        failure.submission_uncertain = True
+        session = _Session([failure])
+        try:
+            with patch("src.services.flow_client.AsyncSession", return_value=session):
+                with self.assertRaises(builtins.ConnectionError) as caught:
+                    await self.call_rpc(client, "YhhmEf")
+                self.assertTrue(caught.exception.submission_uncertain)
+                self.assertNotIn("test-secret", str(caught.exception))
+                self.assertTrue(client._generation_request_was_sent())
+                with self.assertRaisesRegex(RuntimeError, "already sent; replay disabled"):
+                    await self.call_rpc(client, "YhhmEf")
+            session.post.assert_awaited_once()
+            observer.assert_awaited_once()
+        finally:
+            client.clear_generation_sent_callback()
+
+    async def test_credits_successful_xsrf_challenge_retries_once_with_replaced_token(self):
+        client = self.client()
+        session = _Session([
+            SimpleNamespace(status_code=200, text='[["xsrf","refreshed-xsrf"]]'),
+            rpc_response(),
+        ])
+        with patch("src.services.flow_client.AsyncSession", return_value=session):
+            self.assertEqual(await self.call_rpc(client), [100])
+        self.assertEqual(session.post.await_count, 2)
+        first, retry = [parse_qs(call.kwargs["data"]) for call in session.post.await_args_list]
+        self.assertEqual(first["at"], ["test-xsrf"])
+        self.assertEqual(retry["at"], ["refreshed-xsrf"])
+        self.assertEqual(first["f.req"], retry["f.req"])
+        client._load_flow_frontend_bootstrap.assert_awaited_once()
+
+    async def test_credits_http_failure_after_xsrf_retry_retains_status_and_stops(self):
+        client = self.client()
+        session = _Session([
+            SimpleNamespace(status_code=200, text='[["xsrf","refreshed-xsrf"]]'),
+            SimpleNamespace(status_code=503, text='<html>test-secret-response</html>'),
+        ])
+        with patch("src.services.flow_client.AsyncSession", return_value=session):
+            with self.assertRaisesRegex(Exception, "HTTP 503") as caught:
+                await self.call_rpc(client)
+        self.assertEqual(session.post.await_count, 2)
+        self.assertNotIn("test-secret", str(caught.exception))
+
+    async def test_repeated_credits_xsrf_challenge_does_not_send_a_third_post(self):
+        client = self.client()
+        session = _Session([
+            SimpleNamespace(status_code=200, text='[["xsrf","refreshed-xsrf"]]'),
+        ] * 2)
+        with patch("src.services.flow_client.AsyncSession", return_value=session):
+            with self.assertRaisesRegex(RuntimeError, "no payload"):
+                await self.call_rpc(client)
+        self.assertEqual(session.post.await_count, 2)
 
     async def test_timeout_is_not_retried_by_http1_fallback(self):
         client = self.client()

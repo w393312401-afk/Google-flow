@@ -21,9 +21,12 @@ class AccountAdmissionBusy(Exception):
 
 
 class AccountLease:
-    def __init__(self, descriptors, *, capability=None):
+    def __init__(self, descriptors, *, capability=None, issuer=None, token_id=None, kind=None):
         self._descriptors = list(descriptors)
         self.capability = capability
+        self._issuer = issuer
+        self._token_id = token_id
+        self._kind = kind
 
     @property
     def fd(self):
@@ -138,10 +141,41 @@ class AccountAdmission:
                     raise AccountAdmissionBusy("already_running")
             finally:
                 os.close(worker)
-            return AccountLease([owner], capability=capability)
+            return AccountLease(
+                [owner], capability=capability, issuer=self, token_id=token_id,
+                kind="maintenance",
+            )
         except BaseException:
             os.close(owner)
             raise
+
+    def validate_maintenance_lease(self, lease, token_id):
+        """Validate an existing local owner without acquiring its lock again."""
+        token = self._token(token_id)
+        if (not isinstance(lease, AccountLease) or lease._issuer is not self
+                or lease._kind != "maintenance" or lease._token_id != token_id
+                or not isinstance(lease.capability, str)):
+            raise AccountAdmissionBusy("busy_state_unknown")
+        probe = None
+        try:
+            owned = os.fstat(lease.fd)
+            probe = self._open(f"{token}.owner.lock")
+            current = os.fstat(probe)
+            if (owned.st_dev, owned.st_ino) != (current.st_dev, current.st_ino):
+                raise AccountAdmissionBusy("busy_state_unknown")
+            # A live descriptor alone is not proof that its exclusive lock is
+            # still held. A separately opened shared probe must be refused.
+            if self._lock(probe, fcntl.LOCK_SH):
+                raise AccountAdmissionBusy("busy_state_unknown")
+            capability = self._metadata(probe).get("capability")
+            if (not isinstance(capability, str)
+                    or not secrets.compare_digest(capability, lease.capability)):
+                raise AccountAdmissionBusy("busy_state_unknown")
+        except OSError:
+            raise AccountAdmissionBusy("busy_state_unknown") from None
+        finally:
+            if probe is not None:
+                os.close(probe)
 
     def worker(self, token_id, capability):
         token = self._token(token_id)

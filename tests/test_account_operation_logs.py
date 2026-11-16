@@ -101,6 +101,14 @@ class AccountOperationLogTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row["reason"], reason)
             self.assertEqual(row["details"], {"retry_reason": "profile_state_unknown"})
 
+    async def test_credential_recovery_required_remains_actionable_in_audit(self):
+        event = await audit_account_operation(
+            self.db, self.token_id, operation="refresh_at", status="failed",
+            stage="AT_REFRESH", reason="credential_recovery_required",
+        )
+        row = await self.db.get_account_operation_log(event)
+        self.assertEqual(row["reason"], "credential_recovery_required")
+
     async def test_no_snapshot_token_or_service_schema_needed(self):
         bare = str(Path(self.path).with_name("bare.db"))
         first = audit_account_operation_sync(

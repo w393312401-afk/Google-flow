@@ -19,6 +19,12 @@ def account_error_reason(error) -> str:
     detail = getattr(error, "detail", error)
     text = str(detail or "").lower()
     status = getattr(error, "status_code", None)
+    if re.fullmatch(
+        r"(?:(?:at_check|at_verify|at_refresh|st_refresh|protocol_refresh): )?"
+        r"credential recovery (?:required|unavailable)",
+        text,
+    ) or "登录凭证需要恢复" in text:
+        return "credential_recovery_required"
     if any(marker in text for marker in (
         "credentials rejected", "unauthenticated", "google cookies 不完整",
         "页面已跳转到 google 登录", "cookie 被拒绝", "登录态已失效",
@@ -36,6 +42,18 @@ def account_error_reason(error) -> str:
         return "network_or_proxy_unavailable"
     if "metadata" in text:
         return "frontend_metadata_unavailable"
+    if re.fullmatch(
+        r"(?:(?:at_check|at_verify|at_refresh|st_refresh|protocol_refresh): )?"
+        r"upstream validation response invalid",
+        text,
+    ):
+        return "upstream_unavailable"
+    if re.fullmatch(
+        r"(?:(?:at_check|at_verify|at_refresh|st_refresh|protocol_refresh): )?"
+        r"upstream transport unavailable",
+        text,
+    ):
+        return "upstream_unavailable"
     if re.search(r"\bupstream unavailable \(http [45]\d{2}\)", text):
         return "upstream_unavailable"
     if status is not None and 500 <= status <= 599:

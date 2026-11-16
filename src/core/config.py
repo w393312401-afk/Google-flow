@@ -245,7 +245,7 @@ class Config:
 
     @property
     def flow_min_video_credits(self) -> int:
-        """视频生成所需的最低账号积分；低于此值的账号在有其它账号可用时不参与选择(0 表示不检查)。"""
+        """视频生成所需的最低账号积分；校验后已知余额低于此值时不参与选择(0 表示不检查)。"""
         value = self._config.get("flow", {}).get("min_video_credits", 10)
         try:
             return max(0, min(100000, int(value)))
@@ -454,6 +454,14 @@ class Config:
             return max(0.0, min(10.0, float(value)))
         except Exception:
             return 3.0
+
+    @property
+    def browser_startup_warmup(self) -> bool:
+        """服务启动时是否预先打开 browser 模式的打码浏览器（关闭后首个打码请求时才打开）。"""
+        value = self._config.get("captcha", {}).get("browser_startup_warmup", True)
+        if isinstance(value, str):
+            return value.strip().lower() not in {"0", "false", "no", "off"}
+        return bool(value)
 
     @property
     def browser_flow_page_warmup_seconds(self) -> float:

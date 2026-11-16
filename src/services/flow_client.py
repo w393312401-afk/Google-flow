@@ -10,16 +10,22 @@ import base64
 import gzip
 import ssl
 import re
+from contextlib import contextmanager
 from typing import Dict, Any, Optional, List, Union, Callable, Awaitable
 from urllib.parse import parse_qs, quote, urljoin, urlparse
 import urllib.error
 import urllib.request
 from curl_cffi.requests import AsyncSession
+from curl_cffi.requests.exceptions import (
+    ConnectionError as CurlConnectionError,
+    ProxyError as CurlProxyError,
+    Timeout as CurlTimeout,
+)
 from curl_cffi.const import CurlHttpVersion
 from ..core.logger import debug_logger
 from ..core.config import config, get_yescaptcha_min_score
 from .flow_current import CurrentFlowClientMixin
-from .flow_frontend import FlowFrontendMixin
+from .flow_frontend import FlowFrontendMixin, FlowRPCRejected
 from .captcha_errors import BrowserCaptchaError
 
 try:
@@ -156,6 +162,52 @@ class _FlowClientBase(FlowFrontendMixin):
         state = context.get() if context is not None else None
         return bool(state and state["sent"])
 
+    @contextmanager
+    def _allow_rejected_video_model_retry(self, rejection, *, rpc_id, project_id):
+        """Permit one replacement POST after a proven model refusal only."""
+        if not (
+            isinstance(rejection, FlowRPCRejected)
+            and rejection.video_model_not_found
+            and rejection.rpc_id == rpc_id
+        ):
+            raise ValueError("A matching model refusal is required for video fallback")
+        if not hasattr(self, "_video_model_retry_ctx"):
+            self._video_model_retry_ctx = contextvars.ContextVar("flow_video_model_retry", default=None)
+        sent_context = getattr(self, "_generation_sent_ctx", None)
+        permit = {
+            "rpc_id": rpc_id, "source_path": f"/project/{project_id}", "used": False,
+            "active": True,
+            "sent_state": sent_context.get() if sent_context is not None else None,
+        }
+        token = self._video_model_retry_ctx.set(permit)
+        try:
+            yield permit
+        finally:
+            # Child tasks may retain a copied context after this scope exits.
+            permit["active"] = False
+            self._video_model_retry_ctx.reset(token)
+
+    def _consume_video_model_retry(self, url):
+        context = getattr(self, "_video_model_retry_ctx", None)
+        permit = context.get() if context is not None else None
+        if permit is None:
+            return False
+        parsed = urlparse(url)
+        query = parse_qs(parsed.query)
+        sent_context = getattr(self, "_generation_sent_ctx", None)
+        sent_state = sent_context.get() if sent_context is not None else None
+        if (
+            not permit["active"] or permit["used"] or permit["sent_state"] is not sent_state
+            or parsed.scheme != "https" or parsed.hostname != "flow.google.com"
+            or parsed.path != "/_/AiSandboxAngularFrontend/data/batchexecute"
+            or query.get("rpcids") != [permit["rpc_id"]]
+            or query.get("source-path") != [permit["source_path"]]
+        ):
+            raise RuntimeError("Generation POST already sent; replay disabled")
+        # Consume before any await, including when no observer was installed.
+        permit["used"] = True
+        return True
+
     def get_generation_sent_callback(self):
         """Capture state explicitly: Playwright handlers may use another context."""
         context = getattr(self, "_generation_sent_ctx", None)
@@ -177,7 +229,13 @@ class _FlowClientBase(FlowFrontendMixin):
         # Claim before awaiting the observer. Observer failures must never cause
         # an ambiguous generation POST to be replayed by an outer retry loop.
         state["sent"] = True
-        await state["callback"]()
+        try:
+            await state["callback"]()
+        except Exception as error:
+            # The request has been claimed but the transport has not started.
+            # Retain this fixed distinction without exposing callback details.
+            error.generation_observer_failed = True
+            raise
 
     @staticmethod
     def _is_generation_post(method: str, url: str) -> bool:
@@ -752,6 +810,7 @@ class _FlowClientBase(FlowFrontendMixin):
         impersonate: str = "chrome",
         http_version: Optional[int] = None,
         allow_http1_fallback: bool = False,
+        reject_http_errors: bool = False,
     ) -> str:
         """执行原始文本请求（如 SSE），返回响应文本。"""
         fingerprint = self._request_fingerprint_ctx.get()
@@ -882,16 +941,19 @@ class _FlowClientBase(FlowFrontendMixin):
         )
         if config.debug_enabled:
             if isinstance(fingerprint, dict):
-                proxy_for_log = proxy_url if proxy_url else "direct"
-                debug_logger.log_info(
-                    f"[FINGERPRINT] 使用打码浏览器指纹提交文本请求: UA={headers.get('User-Agent', '')[:120]}, proxy={proxy_for_log}"
-                )
+                if redact_sensitive_logs:
+                    debug_logger.log_info("[FINGERPRINT] 使用打码浏览器指纹提交文本请求: <redacted>")
+                else:
+                    proxy_for_log = proxy_url if proxy_url else "direct"
+                    debug_logger.log_info(
+                        f"[FINGERPRINT] 使用打码浏览器指纹提交文本请求: UA={headers.get('User-Agent', '')[:120]}, proxy={proxy_for_log}"
+                    )
             debug_logger.log_request(
                 method=method,
-                url=url,
+                url="<redacted>" if redact_sensitive_logs else url,
                 headers={} if redact_sensitive_logs else headers,
                 body=request_body_for_log,
-                proxy=proxy_url,
+                proxy=None if redact_sensitive_logs else proxy_url,
             )
 
         start_time = time.time()
@@ -914,7 +976,8 @@ class _FlowClientBase(FlowFrontendMixin):
                     else:
                         request_kwargs["json"] = json_data
                     if self._is_generation_post(method, url):
-                        if self._generation_request_was_sent():
+                        model_retry = self._consume_video_model_retry(url)
+                        if self._generation_request_was_sent() and not model_retry:
                             raise RuntimeError("Generation POST already sent; replay disabled")
                         await self._notify_generation_sent()
                     try:
@@ -971,6 +1034,27 @@ class _FlowClientBase(FlowFrontendMixin):
                         duration_ms=duration_ms,
                     )
 
+                if response.status_code >= 400 and reject_http_errors:
+                    # HTTP errors cannot authorize a model fallback, regardless
+                    # of a misleading RPC-looking response body.
+                    rpc_ids = parse_qs(urlparse(url).query).get("rpcids", [])
+                    if (
+                        response.status_code in {401, 403}
+                        and self._is_generation_post(method, url)
+                        and len(rpc_ids) == 1
+                        and rpc_ids[0] in {"YhhmEf", "eb1hJf", "nprQif"}
+                    ):
+                        # Preserve the existing proven-refusal/ledger contract
+                        # for authentication failures, using the HTTP status.
+                        raise FlowRPCRejected(
+                            f"Flow frontend RPC rejected: rpc={rpc_ids[0]}, "
+                            f"code={response.status_code} (HTTP authentication failure)",
+                            rpc_ids[0], response.status_code,
+                        )
+                    error = RuntimeError(f"Flow frontend RPC HTTP {response.status_code}")
+                    error.status_code = response.status_code
+                    raise error
+
                 if response.status_code >= 400 and return_error_response:
                     return response_text
 
@@ -993,7 +1077,10 @@ class _FlowClientBase(FlowFrontendMixin):
                     except Exception:
                         pass
 
-                    debug_logger.log_error(f"[API FAILED] URL: {url}")
+                    debug_logger.log_error(
+                        "[API FAILED] URL: <redacted>"
+                        if redact_sensitive_logs else f"[API FAILED] URL: {url}"
+                    )
                     debug_logger.log_error(
                         f"[API FAILED] Request Body: {request_body_for_log}"
                     )
@@ -1002,10 +1089,14 @@ class _FlowClientBase(FlowFrontendMixin):
                         if redact_sensitive_logs
                         else f"[API FAILED] Response: {response_text}"
                     )
-                    raise Exception(error_reason)
+                    error = RuntimeError(error_reason)
+                    error.status_code = response.status_code
+                    raise error
 
                 return response_text
 
+        except FlowRPCRejected:
+            raise
         except Exception as e:
             error_msg = str(e)
             if "HTTP Error" not in error_msg and not any(
@@ -1019,7 +1110,48 @@ class _FlowClientBase(FlowFrontendMixin):
                         f"[API FAILED] Request Body: {request_body_for_log}"
                     )
                     debug_logger.log_error(f"[API FAILED] Exception: {error_msg}")
-            raise Exception(f"Flow API text request failed: {error_msg}")
+            # Preserve response evidence across this transport boundary. In
+            # particular, HTTP 503 must not become an authentication failure
+            # because an exception's private body happens to mention HTTP 401.
+            status = next((int(value) for value in (
+                getattr(e, "status_code", None),
+                getattr(getattr(e, "response", None), "status_code", None),
+            ) if re.fullmatch(r"[45]\d{2}", str(value or ""))), None)
+            timeout_error = isinstance(e, (TimeoutError, CurlTimeout)) or getattr(e, "code", None) == 28
+            observer_error = getattr(e, "generation_observer_failed", False) is True
+            video_connection_lost_text = re.search(
+                r"\bvideo connection lost\b", error_msg, re.IGNORECASE,
+            ) is not None
+            connection_lost_text = re.search(r"\bconnection lost\b", error_msg, re.IGNORECASE) is not None
+            connection_error = (isinstance(e, (ConnectionError, CurlConnectionError, CurlProxyError))
+                                or connection_lost_text)
+            if redact_sensitive_logs:
+                if status is not None:
+                    error_msg = f"HTTP {status}"
+                elif timeout_error:
+                    error_msg = "request timed out"
+                elif observer_error:
+                    error_msg = "generation observer unavailable"
+                elif connection_error:
+                    error_msg = ("video connection lost" if video_connection_lost_text
+                                 else "connection lost" if connection_lost_text
+                                 else "connection unavailable")
+                elif error_msg != "Generation POST already sent; replay disabled":
+                    error_msg = "request failed"
+            elif not error_msg:
+                error_msg = type(e).__name__
+            error_type = (TimeoutError if timeout_error else ConnectionError if connection_error else RuntimeError)
+            wrapped = error_type(f"Flow API text request failed: {error_msg}")
+            if status is not None:
+                wrapped.status_code = status
+            for attribute in (
+                "submission_uncertain", "outcome_unknown", "submission_pending",
+                "upstream_accepted", "generation_observer_failed",
+            ):
+                value = getattr(e, attribute, None)
+                if isinstance(value, bool):
+                    setattr(wrapped, attribute, value)
+            raise wrapped from None
 
     def _should_fallback_to_urllib(self, error_message: str) -> bool:
         """判断是否应从 curl_cffi 回退到 urllib。"""

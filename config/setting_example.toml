@@ -59,6 +59,7 @@ captcha_method = "yescaptcha"  # 打码方式: yescaptcha/captcharun/twocaptcha/
 browser_recaptcha_settle_seconds = 3.0  # 自定义站点分数测试在 reload/clr 就绪后的额外稳态等待
 browser_flow_page_warmup_seconds = 6.0  # browser harvest 打开 Flow 页面后的稳定等待
 browser_count = 1  # browser 模式的有头浏览器实例数量
+browser_startup_warmup = true  # 服务启动时是否预先打开 browser 模式打码浏览器；false 则等首个打码请求时再打开
 browser_captcha_max_retries = 5  # browser 模式单次获取验证码的最大重试次数
 browser_captcha_generation_retries = 6  # 生成接口遇到 reCAPTCHA evaluation failed 时的总重试次数
 personal_solve_strategy = "auto"  # auto=优先 trusted JS、失败切原生 harvest；direct/harvest 可强制指定

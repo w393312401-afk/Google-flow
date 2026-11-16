@@ -2,7 +2,9 @@
 
 Run with FLOW2API_PUBLIC_CONFIG pointing at a private JSON file containing
 public_origin, api_key, admin_username, admin_password, backend_url and
-database_path. Running this file directly binds only 127.0.0.1:38001 and disables
+database_path. Set admin_auth_mode to "local" to use the current backend admin
+credentials instead of an independent public admin login. Running this file
+directly binds only 127.0.0.1:38001 and disables
 access logging, including query-string API keys. No backend settings are written.
 """
 
@@ -56,6 +58,7 @@ class GatewaySettings:
     admin_password: str = field(repr=False)
     backend_url: str
     database_path: str
+    admin_auth_mode: str = "independent"
 
     def __post_init__(self) -> None:
         public = urlsplit(self.public_origin)
@@ -76,10 +79,17 @@ class GatewaySettings:
         # Force port parsing here, so malformed configuration fails before serving.
         public.port
         backend.port
-        for secret, minimum in ((self.api_key, 32), (self.admin_password, 24)):
+        if self.admin_auth_mode not in {"independent", "local"}:
+            raise ValueError("Unsupported administrator authentication mode")
+        secrets = [(self.api_key, 32)]
+        if self.admin_auth_mode == "independent":
+            secrets.append((self.admin_password, 24))
+        for secret, minimum in secrets:
             if not isinstance(secret, str) or len(secret) < minimum or len(set(secret)) < 8:
-                raise ValueError("Public credentials must be long, independent secrets")
-        if not isinstance(self.admin_username, str) or not self.admin_username:
+                raise ValueError("Public credentials must be long secrets")
+        if self.admin_auth_mode == "independent" and (
+            not isinstance(self.admin_username, str) or not self.admin_username
+        ):
             raise ValueError("A public admin username is required")
         if not Path(self.database_path).is_absolute():
             raise ValueError("database_path must be absolute")
@@ -265,8 +275,9 @@ def create_app(settings: GatewaySettings | None = None,
             credentials = await asyncio.to_thread(read_backend_credentials, configuration.database_path)
         except (sqlite3.Error, OSError, ValueError):
             raise RuntimeError("Public gateway backend credentials are unavailable") from None
-        if _matches(configuration.api_key, credentials.api_key) or _matches(
-            configuration.admin_password, credentials.password
+        if _matches(configuration.api_key, credentials.api_key) or (
+            configuration.admin_auth_mode == "independent"
+            and _matches(configuration.admin_password, credentials.password)
         ):
             raise RuntimeError("Public gateway requires independent credentials")
         application.state.settings = configuration
@@ -336,9 +347,15 @@ def create_app(settings: GatewaySettings | None = None,
                     submitted = json.loads(await _limited_body(request.stream(), MAX_LOGIN_BYTES))
                 except (ValueError, UnicodeDecodeError):
                     return _error(400, "Invalid login request")
+                if configuration.admin_auth_mode == "local":
+                    expected_username = credentials.username
+                    expected_password = credentials.password
+                else:
+                    expected_username = configuration.admin_username
+                    expected_password = configuration.admin_password
                 if not isinstance(submitted, dict) or not (
-                    _matches(submitted.get("username"), configuration.admin_username)
-                    and _matches(submitted.get("password"), configuration.admin_password)
+                    _matches(submitted.get("username"), expected_username)
+                    and _matches(submitted.get("password"), expected_password)
                 ):
                     return _error(401, "Invalid credentials")
                 body = json.dumps({"username": credentials.username, "password": credentials.password}).encode()

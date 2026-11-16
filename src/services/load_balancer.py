@@ -32,6 +32,7 @@ class _GenerationCooldown:
     retry_after: float
     last_failure: float
     account: str = ""
+    credit_balance: Optional[int] = None
 
 
 class LoadBalancer:
@@ -66,6 +67,12 @@ class LoadBalancer:
         credits = getattr(token, "credits", None)
         return bool(floor) and credits is not None and credits < floor
 
+    def _validation_cooldown_reason(self, token: Token) -> Optional[str]:
+        """Check the account's current identity before any route preparation."""
+        getter = getattr(self.token_manager, "get_validation_cooldown_reason", None)
+        reason = getter(token) if callable(getter) else None
+        return reason if isinstance(reason, str) and reason.strip() else None
+
     @staticmethod
     def _generation_failure_category(error, scope: str, model: Optional[str]):
         """Only fixed, typed runtime failures affect temporary routing health."""
@@ -79,6 +86,10 @@ class LoadBalancer:
         if not isinstance(error, BrowserCaptchaError) or error.submission_pending is not False:
             return None
         stage, reason = error.stage, error.reason
+        if stage == "native_submit_prepare" and reason == "insufficient_credits":
+            # A model can cost more than another capability. Keep this circuit
+            # scoped to the selection that displayed the explicit UI warning.
+            return scope, model, "当前模型积分不足 [insufficient_credits]", 900, 3600
         setup_reasons = {f"{phase}_failed" for phase in (
             "open", "summary_find", "summary_click", "panel_wait", "mode", "model",
             "duration", "submode", "resolution", "ratio", "count", "save",
@@ -97,7 +108,7 @@ class LoadBalancer:
         } and reason in {
             "browser_operation_failed", "navigation_failed", "timeout", "flow_editor_unavailable",
             "flow_page_unavailable", "prompt_input_mismatch", "prompt_changed_during_upload",
-            "submit_unavailable", "proxy_connection_failed", "editor_missing",
+            "submit_unavailable", "proxy_connection_failed", "editor_missing", "project_not_found",
             "network_empty_response", "network_connection_failed", "navigation_interrupted",
             "submit_control_missing", "submit_control_not_ready",
             "browser_closed", "element_detached", "click_intercepted", "submit_disabled",
@@ -153,6 +164,9 @@ class LoadBalancer:
         self._generation_cooldowns.pop(previous_key, None)
         self._generation_cooldowns[key] = _GenerationCooldown(
             identity, reason, failures, now + cooldown_seconds, now, account,
+            credit_balance=(getattr(token, "credits", None)
+                            if isinstance(error, BrowserCaptchaError) and error.reason == "insufficient_credits"
+                            else None),
         )
         # Only fixed categories are logged, never upstream bodies/credentials.
         debug_logger.logger.warning(
@@ -205,17 +219,24 @@ class LoadBalancer:
             cooldown = self._generation_cooldowns.get(key)
             if cooldown is None:
                 continue
+            credits = getattr(token, "credits", None)
+            if (cooldown.credit_balance is not None and credits is not None
+                    and credits > cooldown.credit_balance):
+                # A refreshed/top-up balance permits a new UI check immediately;
+                # the warning remains authoritative if it still cannot pay.
+                self._generation_cooldowns.pop(key, None)
+                continue
             if cooldown.retry_after > now:
                 remaining = math.ceil(cooldown.retry_after - now)
                 reasons.append(f"{cooldown.reason}（临时冷却，{remaining} 秒后可重试）")
         return "; ".join(reasons) if reasons else None
 
     @staticmethod
-    def _selection_unavailable_message(health_failures, cooldown_failures) -> str:
-        if not cooldown_failures:
+    def _selection_unavailable_message(health_failures, cooldown_failures, credit_failures=()) -> str:
+        if not cooldown_failures and not credit_failures:
             return LoadBalancer._health_unavailable_message(health_failures)
         return "当前符合条件的账号暂时无法生成：" + "; ".join(dict.fromkeys(
-            cooldown_failures + health_failures
+            list(credit_failures) + cooldown_failures + health_failures
         ))
 
     @staticmethod
@@ -464,6 +485,7 @@ class LoadBalancer:
         health_candidate_count = 0
         health_failures = []
         cooldown_failures = []
+        credit_failures = []
         excluded = set(exclude_token_ids or ())
 
         for token in active_tokens:
@@ -520,6 +542,12 @@ class LoadBalancer:
                     filtered_reasons[token.id] = "视频并发已满"
                     continue
 
+            validation_reason = self._validation_cooldown_reason(token)
+            if validation_reason:
+                filtered_reasons[token.id] = validation_reason
+                health_failures.append(validation_reason)
+                continue
+
             cooldown_reason = self.get_generation_cooldown_reason(
                 token, for_image_generation=for_image_generation,
                 for_video_generation=for_video_generation, model=model,
@@ -541,18 +569,11 @@ class LoadBalancer:
                 "remaining": remaining,
                 "needs_refresh": self.token_manager.needs_at_refresh(token),
                     "random": random.random(),
-                    "low_credit": for_video_generation and self._below_video_credit_floor(token),
                 }
             )
 
-        # Prefer accounts that can pay for the video. When none can, keep them
-        # all: a stale or unreadable balance must not become a pool-wide outage.
-        funded = [item for item in available_tokens if not item["low_credit"]]
-        if funded and len(funded) != len(available_tokens):
-            for item in available_tokens:
-                if item["low_credit"]:
-                    filtered_reasons[item["token"].id] = f"账号积分不足（剩余 {item['token'].credits}）"
-            available_tokens = funded
+        # Cached credits only describe a candidate. Validate it before enforcing
+        # the floor so a newly refreshed balance can restore video selection.
 
         if filtered_reasons:
             debug_logger.log_info(f"[LOAD_BALANCER] 已过滤Token:")
@@ -560,7 +581,7 @@ class LoadBalancer:
                 debug_logger.log_info(f"[LOAD_BALANCER]   - Token {token_id}: {reason}")
 
         if not available_tokens:
-            if health_candidate_count and len(cooldown_failures) == health_candidate_count:
+            if health_candidate_count and len(health_failures) + len(cooldown_failures) == health_candidate_count:
                 self._selection_health.set((
                     selection_owner, selection_key,
                     self._selection_unavailable_message(health_failures, cooldown_failures),
@@ -643,6 +664,13 @@ class LoadBalancer:
             token_id = token.id
             selected = False
             try:
+                # Another validation may fail after candidate collection or
+                # while a pending reservation is awaited. Do not rotate away
+                # from that identity and inadvertently clear its backoff.
+                validation_reason = self._validation_cooldown_reason(token)
+                if validation_reason:
+                    health_failures.append(validation_reason)
+                    continue
                 if exit_rotation is not None:
                     try:
                         token = await exit_rotation.prepare_token(token)
@@ -661,16 +689,48 @@ class LoadBalancer:
                 if cooldown_reason:
                     cooldown_failures.append(cooldown_reason)
                     continue
+
+                validation_reason = self._validation_cooldown_reason(token)
+                if validation_reason:
+                    health_failures.append(validation_reason)
+                    continue
+
+                consume_outcome = getattr(self.token_manager, "consume_validation_outcome", None)
+                if callable(consume_outcome):
+                    # This caller's earlier validation must not authorize a
+                    # route change if this attempt exits for busy/cooldown.
+                    consume_outcome(token_id)
                 token = await self.token_manager.ensure_valid_token(token)
+                outcome = consume_outcome(token_id) if callable(consume_outcome) else None
                 if not token:
-                    if exit_rotation is not None:
+                    has_failure_evidence = (
+                        getattr(outcome, "token_id", None) == token_id
+                        and getattr(outcome, "success", None) is False
+                        and isinstance(getattr(outcome, "reason", None), str)
+                        and isinstance(getattr(outcome, "identity", None), str)
+                        and bool(outcome.identity)
+                    )
+                    reason = (outcome.reason if has_failure_evidence
+                              else get_health_error(token_id) if callable(get_health_error) else None)
+                    if exit_rotation is not None and (has_failure_evidence or not callable(consume_outcome)):
                         try:
-                            await exit_rotation.mark_health_error(token_id)
+                            mark_health_error = exit_rotation.mark_health_error
+                            if (has_failure_evidence
+                                    and getattr(exit_rotation, "accepts_health_error_identity", False)):
+                                await mark_health_error(
+                                    token_id, error=reason, failed_identity=outcome.identity,
+                                )
+                            elif getattr(exit_rotation, "accepts_health_error_reason", False):
+                                # TokenManager exposes a fixed, credential-free
+                                # category. The rotation service decides whether
+                                # that category is a real route failure.
+                                await mark_health_error(token_id, error=reason)
+                            else:
+                                await mark_health_error(token_id)
                         except Exception as exc:
                             debug_logger.log_warning(
                                 f"[EXIT_ROTATION] Token {token_id}: health state write failed ({type(exc).__name__})"
                             )
-                    reason = get_health_error(token_id) if callable(get_health_error) else None
                     if isinstance(reason, str) and reason.strip():
                         health_failures.append(reason)
                     debug_logger.log_info(
@@ -684,6 +744,12 @@ class LoadBalancer:
                 )
                 if cooldown_reason:
                     cooldown_failures.append(cooldown_reason)
+                    continue
+
+                if for_video_generation and self._below_video_credit_floor(token):
+                    credit_failures.append(
+                        f"视频生成积分不足（剩余 {token.credits}，最低要求 {getattr(config, 'flow_min_video_credits', 10)}）"
+                    )
                     continue
 
                 if reserve and not await self._reserve_slot(
@@ -712,10 +778,10 @@ class LoadBalancer:
                         token_id, for_image_generation, for_video_generation
                     )
 
-        if health_candidate_count and len(health_failures) + len(cooldown_failures) == health_candidate_count:
+        if health_candidate_count and len(health_failures) + len(cooldown_failures) + len(credit_failures) == health_candidate_count:
             self._selection_health.set((
                 selection_owner, selection_key,
-                self._selection_unavailable_message(health_failures, cooldown_failures),
+                self._selection_unavailable_message(health_failures, cooldown_failures, credit_failures),
             ))
         debug_logger.log_info(
             f"[LOAD_BALANCER] ❌ 候选Token均不可用 (图片生成={for_image_generation}, 视频生成={for_video_generation})"

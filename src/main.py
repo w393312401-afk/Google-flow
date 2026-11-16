@@ -200,8 +200,14 @@ async def _lifespan_admitted(app: FastAPI):
         from .services.browser_captcha import BrowserCaptchaService
 
         browser_service = await BrowserCaptchaService.get_instance(db)
-        await browser_service.warmup_browser_slots()
-        print("Browser captcha service initialized (headed mode)")
+        if config.browser_startup_warmup:
+            await browser_service.warmup_browser_slots()
+            print("Browser captcha service initialized (headed mode)")
+        else:
+            print(
+                "Browser captcha service initialized (headed mode, startup warmup "
+                "disabled; browsers open on first captcha request)"
+            )
 
     # Initialize concurrency manager
     await concurrency_manager.initialize(tokens)

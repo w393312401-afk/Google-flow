@@ -5,7 +5,7 @@ import json
 import os
 import types
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from src.services.captcha_errors import BrowserCaptchaError
 from urllib.parse import urlencode
@@ -56,6 +56,95 @@ class BrowserCaptchaTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(TokenBrowser._parse_harvest_streamchat_post(None))
         self.assertIsNone(TokenBrowser._parse_harvest_streamchat_post("at=only"))
         self.assertIsNone(TokenBrowser._parse_harvest_streamchat_post("f.req=not-json"))
+
+    async def _prepare_runtime_route(self):
+        # Import the real module so fixture globals cannot supply missing imports.
+        browser = object.__new__(TokenBrowser)
+        browser.token_id = 1
+        browser._browser_proxy_active = False
+        browser._harvest_streamchat_post = None
+        browser._harvest_rpc = None
+        browser._harvest_route_error = None
+        browser._captcha_stage = "idle"
+        browser._record_captcha_stage = Mock()
+        browser._capture_captcha_page_state = AsyncMock(
+            return_value={"location": "google_signin"}
+        )
+        page = types.SimpleNamespace(
+            route=AsyncMock(), goto=AsyncMock(), close=AsyncMock()
+        )
+        with self.assertRaises(BrowserCaptchaError) as caught:
+            await browser._prepare_flow_runtime_page(page, "project", "key", "action")
+        self.assertEqual(caught.exception.reason, "login_required")
+        return browser, page, page.route.await_args.args[1]
+
+    @staticmethod
+    def _batched_rpc_body(rpc: str) -> str:
+        return urlencode({
+            "f.req": json.dumps([[[rpc, '["safe & synthetic"]', None, "generic"]]])
+        })
+
+    async def test_runtime_route_continues_non_generation_requests(self):
+        browser, page, handler = await self._prepare_runtime_route()
+        for method, path, body in (
+            ("GET", "/data/batchexecute?rpcids=ogiZ0b", None),
+            ("POST", "/telemetry", "payload=synthetic"),
+            ("POST", "/data/batchexecute?rpcids=syntheticRead", self._batched_rpc_body("syntheticRead")),
+            ("POST", "/data/batchexecute?rpcids=syntheticRead", "malformed"),
+            ("POST", "/data/batchexecute", self._batched_rpc_body("syntheticRead")),
+        ):
+            with self.subTest(method=method, path=path):
+                route = types.SimpleNamespace(
+                    request=types.SimpleNamespace(
+                        method=method, url="https://flow.google.com" + path, post_data=body
+                    ),
+                    abort=AsyncMock(), continue_=AsyncMock(),
+                )
+                await handler(route)
+                route.continue_.assert_awaited_once()
+                route.abort.assert_not_awaited()
+                self.assertIsNone(browser._harvest_streamchat_post)
+                self.assertIsNone(browser._harvest_route_error)
+        page.close.assert_not_awaited()
+
+    async def test_runtime_route_aborts_generation_from_body_or_query(self):
+        browser, _, handler = await self._prepare_runtime_route()
+        for rpc, path, body in (
+            ("StreamChat", "/rpc/StreamChat", "synthetic-streamchat"),
+            ("ogiZ0b", "/data/batchexecute", self._batched_rpc_body("ogiZ0b")),
+            ("YhhmEf", "/data/batchexecute?rpcids=syntheticRead", self._batched_rpc_body("YhhmEf")),
+            ("ogiZ0b", "/data/batchexecute?rpcids=syntheticRead,ogiZ0b", "malformed"),
+            ("YhhmEf", "/data/batchexecute?rpcids=syntheticRead&rpcids=YhhmEf", "malformed"),
+        ):
+            with self.subTest(rpc=rpc, path=path):
+                browser._harvest_streamchat_post = None
+                route = types.SimpleNamespace(
+                    request=types.SimpleNamespace(
+                        method="POST", url="https://flow.google.com" + path, post_data=body
+                    ),
+                    abort=AsyncMock(), continue_=AsyncMock(),
+                )
+                await handler(route)
+                route.abort.assert_awaited_once()
+                route.continue_.assert_not_awaited()
+                self.assertEqual(browser._harvest_rpc, rpc)
+                self.assertEqual(browser._harvest_streamchat_post, body)
+
+    async def test_runtime_route_failed_abort_closes_page_without_sending_request(self):
+        browser, page, handler = await self._prepare_runtime_route()
+        route = types.SimpleNamespace(
+            request=types.SimpleNamespace(
+                method="POST", url="https://flow.google.com/data/batchexecute?rpcids=ogiZ0b",
+                post_data=self._batched_rpc_body("ogiZ0b"),
+            ),
+            abort=AsyncMock(side_effect=RuntimeError("synthetic abort failure")),
+            continue_=AsyncMock(),
+        )
+        await handler(route)
+        route.continue_.assert_not_awaited()
+        page.close.assert_awaited_once()
+        self.assertEqual(browser._harvest_route_error, "request_interception_failed")
+        self.assertIsNone(browser._harvest_streamchat_post)
 
     async def test_missing_token_is_not_retried_against_the_same_page(self):
         browser = object.__new__(TokenBrowser)

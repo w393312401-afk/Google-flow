@@ -6,7 +6,7 @@ from urllib.parse import parse_qs
 
 from curl_cffi.requests.headers import Headers
 
-from src.services.flow_frontend import FlowFrontendMixin
+from src.services.flow_frontend import FlowFrontendBootstrapError, FlowFrontendMixin
 
 
 BOOTSTRAP = (
@@ -203,11 +203,14 @@ class FlowFrontendSessionTests(unittest.IsolatedAsyncioTestCase):
         response.url = "https://accounts.google.com/signin"
         updates = []
         with patch("src.services.flow_frontend.AsyncSession", return_value=_Session(response)):
-            with self.assertRaisesRegex(RuntimeError, "登录认证失败"):
+            with self.assertRaises(FlowFrontendBootstrapError) as caught:
                 await _Client()._load_flow_frontend_bootstrap(
                     "https://flow.google.com/project/test", "OSID=old", 30,
                     cookie_updates=updates,
                 )
+        self.assertEqual(caught.exception.reason, "login_redirect")
+        self.assertEqual(caught.exception.status_code, 200)
+        self.assertNotIn("untrusted", str(caught.exception))
         self.assertEqual(updates, [])
 
 

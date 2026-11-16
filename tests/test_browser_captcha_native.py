@@ -247,11 +247,13 @@ process.stdout.write(JSON.stringify({
     def test_private_diagnostics_are_bounded_and_allowlisted(self):
         for _ in range(80):
             self.browser._record_captcha_stage("editor_wait", "editor_missing", editor_present=False,
-                cookie_count=26, url="https://private.invalid/account", editorText="private text", token="secret")
+                project_not_found=True, cookie_count=26,
+                url="https://private.invalid/account", editorText="private text", token="secret")
         directory = Path(self.directory.name) / "diagnostics"
         path = directory / "slot_0.json"
         raw = path.read_text()
         self.assertEqual(len(json.loads(raw)), 48)
+        self.assertIs(json.loads(raw)[-1]["project_not_found"], True)
         self.assertNotIn("private", raw)
         self.assertNotIn("secret", raw)
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
@@ -293,6 +295,72 @@ process.stdout.write(JSON.stringify(vm.runInContext(input.script, context)()));
                 self.assertEqual(state["submit_present"], label != "Unrelated action")
                 self.assertEqual(state["submit_disabled"], label != "Unrelated action")
                 self.assertEqual(state["location"], "flow_project")
+
+    async def test_page_state_distinguishes_missing_project_from_editor_and_other_errors(self):
+        node_path = shutil.which("node")
+        if not node_path:
+            self.skipTest("Node.js is required to execute the page state regression")
+        page = types.SimpleNamespace(evaluate=AsyncMock(return_value={}))
+        await self.browser._capture_captcha_page_state(page)
+        script = page.evaluate.await_args.args[0]
+        harness = r"""
+const vm = require('node:vm');
+const input = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
+const editor = input.editor ? {offsetWidth: 100} : null;
+const document = {
+    body: { innerText: input.text }, readyState: 'complete',
+    querySelector(selector) { return selector === '.ProseMirror' ? editor : null; },
+    querySelectorAll() { return []; },
+};
+const context = vm.createContext({
+    document, location: { hostname: input.host, pathname: '/error' }, window: {},
+});
+process.stdout.write(JSON.stringify(vm.runInContext(input.script, context)()));
+"""
+        for text, editor, expected in (
+            ("Project not found.", False, True),
+            ("Your oldest creations will expire soon.\nProject not found.\nBack to projects", False, True),
+            ("Project not found.", True, False),
+            ("A picture of the text Project not found.", False, False),
+            ("Something went wrong.", False, False),
+        ):
+            with self.subTest(editor=editor, expected=expected, text=text):
+                result = subprocess.run(
+                    [node_path, "-e", harness],
+                    input=json.dumps({"script": script, "text": text, "editor": editor, "host": "flow.google.com"}),
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                state = json.loads(result.stdout)
+                self.assertIs(state["project_not_found"], expected)
+                self.assertNotIn(text, json.dumps(state))
+
+    async def test_explicit_missing_project_stops_before_editor_or_captcha_wait(self):
+        page, editor = self._ready_flow_page()
+        self.browser._capture_captcha_page_state.return_value = {
+            "location": "flow_home", "ready_state": "complete", "project_not_found": True,
+        }
+        self.browser._save_editor_failure_evidence = AsyncMock()
+        with self.assertRaises(BrowserCaptchaError) as raised:
+            await self._prepare_ready_page(page)
+        self.assertEqual((raised.exception.stage, raised.exception.reason), ("page_loaded", "project_not_found"))
+        editor.wait_for.assert_not_awaited()
+        self.browser._wait_for_enterprise_ready.assert_not_awaited()
+        self.browser._save_editor_failure_evidence.assert_awaited_once_with(page, "project_not_found")
+
+    async def test_missing_project_after_editor_wait_keeps_exact_reason(self):
+        page, editor = self._ready_flow_page()
+        editor.wait_for.side_effect = TimeoutError("synthetic timeout")
+        self.browser._capture_captcha_page_state.side_effect = [
+            {"location": "flow_project"},
+            {"location": "flow_home", "ready_state": "complete", "project_not_found": True},
+        ]
+        self.browser._save_editor_failure_evidence = AsyncMock()
+        with self.assertRaises(BrowserCaptchaError) as raised:
+            await self._prepare_ready_page(page)
+        self.assertEqual((raised.exception.stage, raised.exception.reason), ("editor_readiness", "project_not_found"))
+        self.browser._wait_for_enterprise_ready.assert_not_awaited()
+        self.browser._save_editor_failure_evidence.assert_awaited_once_with(page, "project_not_found")
 
     async def test_raw_exception_becomes_safe_stage_failure(self):
         context = types.SimpleNamespace(new_page=AsyncMock(side_effect=RuntimeError("secret https://private.invalid")))

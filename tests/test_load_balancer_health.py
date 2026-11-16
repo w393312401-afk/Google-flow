@@ -60,7 +60,7 @@ class LoadBalancerHealthTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(
             patch(
                 "src.services.load_balancer.config",
-                SimpleNamespace(captcha_method="browser", call_logic_mode="polling"),
+                SimpleNamespace(captcha_method="browser", call_logic_mode="polling", flow_min_video_credits=0),
             )
         )
 
@@ -208,6 +208,108 @@ class LoadBalancerHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.id, healthy)
         self.assertIsNotNone(self.manager.get_last_validation_error(failed))
         self.assertIsNone(await self.balancer.get_unavailable_reason(for_image_generation=True))
+
+    async def test_validation_backoff_prevents_rotation_and_rpc_until_deadline(self):
+        token_id = await self.add_token()
+        self.failures[token_id] = "HTTP 503"
+        rotations = 0
+
+        async def rotate(token):
+            nonlocal rotations
+            rotations += 1
+            return await self.rotated(token.id, rotations)
+
+        rotation = SimpleNamespace(
+            prepare_token=AsyncMock(side_effect=rotate), mark_health_error=AsyncMock(),
+        )
+        self.balancer.exit_rotation = rotation
+        self.assertIsNone(await self.balancer.select_token(for_image_generation=True))
+        self.assertEqual(rotation.prepare_token.await_count, 1)
+        self.assertEqual(self.flow._current_rpc.await_count, 1)
+        for _ in range(12):
+            self.assertIsNone(await self.balancer.select_token(for_image_generation=True, track_pending=True))
+            self.assertIn("HTTP 503", await self.balancer.get_unavailable_reason(for_image_generation=True))
+        self.monotonic.return_value += 59
+        self.assertIsNone(await self.balancer.select_token(for_image_generation=True))
+        self.assertEqual(rotation.prepare_token.await_count, 1)
+        self.assertEqual(self.flow._current_rpc.await_count, 1)
+        rotation.mark_health_error.assert_awaited_once_with(token_id)
+        self.assertEqual(self.balancer._image_pending, {})
+        self.failures.clear()
+        self.monotonic.return_value += 1
+        self.assertEqual((await self.balancer.select_token(for_image_generation=True)).id, token_id)
+        self.assertEqual(rotation.prepare_token.await_count, 2)
+        self.assertEqual(self.flow._current_rpc.await_count, 2)
+        self.assertTrue((await self.db.get_token(token_id)).is_active)
+        self.assertEqual((await self.db.get_token_stats(token_id)).consecutive_error_count, 0)
+
+    async def test_changed_proxy_or_cookie_identity_can_retry_validation_before_deadline(self):
+        for field, replacement in (
+            ("proxy_url", "http://repaired-route.example:8022"),
+            ("google_cookies", "OSID=repaired-cookie; SID=repaired-sid"),
+        ):
+            with self.subTest(field=field):
+                token_id = await self.add_token()
+                token = await self.db.get_token(token_id)
+                await self.manager._record_at_failure(
+                    token_id, "AT_CHECK: upstream unavailable (HTTP 503)",
+                    error=RuntimeError("HTTP 503"), token=token,
+                )
+                await self.db.update_token(token_id, **{field: replacement})
+                rotation = SimpleNamespace(
+                    prepare_token=AsyncMock(side_effect=lambda candidate: candidate),
+                    mark_health_error=AsyncMock(),
+                )
+                self.balancer.exit_rotation = rotation
+                self.flow._current_rpc.reset_mock()
+                self.assertEqual((await self.balancer.select_token(
+                    for_image_generation=True, exclude_token_ids=set(range(1, token_id)),
+                )).id, token_id)
+                rotation.prepare_token.assert_awaited_once()
+                self.flow._current_rpc.assert_awaited_once()
+                rotation.mark_health_error.assert_not_awaited()
+
+    async def test_validation_backoff_opened_after_pending_claim_prevents_rotation(self):
+        token_id = await self.add_token()
+        original_claim = self.balancer._claim_pending_candidate
+
+        async def claim_then_fail(*args):
+            candidate = await original_claim(*args)
+            await self.manager._record_at_failure(
+                token_id, "AT_CHECK: upstream unavailable (HTTP 503)",
+                error=RuntimeError("HTTP 503"), token=candidate["token"],
+            )
+            return candidate
+
+        self.balancer._claim_pending_candidate = claim_then_fail
+        rotation = SimpleNamespace(prepare_token=AsyncMock(), mark_health_error=AsyncMock())
+        self.balancer.exit_rotation = rotation
+        self.assertIsNone(await self.balancer.select_token(for_image_generation=True, track_pending=True))
+        self.assertIn("HTTP 503", await self.balancer.get_unavailable_reason(for_image_generation=True))
+        rotation.prepare_token.assert_not_awaited()
+        rotation.mark_health_error.assert_not_awaited()
+        self.flow._current_rpc.assert_not_awaited()
+        self.assertEqual(self.balancer._image_pending, {})
+
+    async def test_validation_backoff_opened_during_prepare_skips_rpc_without_new_exit_error(self):
+        token_id = await self.add_token()
+
+        async def prepare_then_fail(token):
+            await self.manager._record_at_failure(
+                token_id, "AT_CHECK: upstream unavailable (HTTP 503)",
+                error=RuntimeError("HTTP 503"), token=token,
+            )
+            return token
+
+        rotation = SimpleNamespace(
+            prepare_token=AsyncMock(side_effect=prepare_then_fail), mark_health_error=AsyncMock(),
+        )
+        self.balancer.exit_rotation = rotation
+        self.assertIsNone(await self.balancer.select_token(for_image_generation=True, track_pending=True))
+        rotation.prepare_token.assert_awaited_once()
+        rotation.mark_health_error.assert_not_awaited()
+        self.flow._current_rpc.assert_not_awaited()
+        self.assertEqual(self.balancer._image_pending, {})
 
     async def test_unchecked_candidate_does_not_report_all_accounts_failed(self):
         failed = await self.add_token()
@@ -369,6 +471,7 @@ class LoadBalancerHealthTests(unittest.IsolatedAsyncioTestCase):
             BrowserCaptchaError("native_generation_setup", "mode_failed"),
             unsubmitted_browser_error("native_generation_setup", "invalid_spec"),
             BrowserCaptchaError("native_response", "response_missing"),
+            BrowserCaptchaError("native_submit_prepare", "insufficient_credits"),
             BrowserCaptchaError("private-stage", "private-cookie"),
             unsubmitted_browser_error("native_generation_setup", "private_cookie_failed"),
             RuntimeError(TRAFFIC_ERROR),
@@ -460,6 +563,25 @@ class LoadBalancerHealthTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(reason, await self.balancer.get_unavailable_reason(for_video_generation=True))
                 self.assertTrue((await self.db.get_token(token_id)).is_active)
                 self.balancer.record_generation_success(token_id, for_video_generation=True, token=token)
+
+    async def test_missing_project_cools_account_only_with_explicit_no_submit_evidence(self):
+        failed_id, alternative_id = await self.add_token(), await self.add_token()
+        token = await self.db.get_token(failed_id)
+        for pending in (None, True):
+            failure = BrowserCaptchaError("editor_readiness", "project_not_found")
+            failure.submission_pending = pending
+            self.assertFalse(await self.balancer.record_generation_failure(
+                failed_id, failure, for_video_generation=True, token=token,
+            ))
+            self.assertIsNone(self.balancer.get_generation_cooldown_reason(token, for_video_generation=True))
+        failure = unsubmitted_browser_error("editor_readiness", "project_not_found")
+        self.assertTrue(await self.balancer.record_generation_failure(
+            failed_id, failure, for_video_generation=True, token=token,
+        ))
+        self.assertIn("project_not_found", self.balancer.get_generation_cooldown_reason(token, for_video_generation=True))
+        self.assertEqual((await self.balancer.select_token(for_video_generation=True)).id, alternative_id)
+        self.assertTrue((await self.db.get_token(failed_id)).is_active)
+        self.assertEqual((await self.db.get_token_stats(failed_id)).consecutive_error_count, 0)
 
     async def test_new_native_actionability_failures_back_off_and_route_to_another_account(self):
         failed_id, alternative_id = await self.add_token(), await self.add_token()
@@ -641,16 +763,80 @@ class LoadBalancerHealthTests(unittest.IsolatedAsyncioTestCase):
         return {(await self.balancer.select_token(**flags)).id for _ in range(count)}
 
     async def test_underfunded_video_account_is_skipped_while_a_funded_account_exists(self):
+        self.set_min_video_credits(10)
         poor = await self.add_token(credits=2)
         rich = await self.add_token(credits=500)
         self.assertEqual(await self.selected_ids(for_video_generation=True), {rich})
         # Credits only gate video; the same accounts stay usable for images.
         self.assertEqual(await self.selected_ids(for_image_generation=True), {poor, rich})
 
-    async def test_underfunded_accounts_stay_selectable_when_none_is_funded(self):
+    async def test_all_validated_underfunded_accounts_report_credits_without_generation(self):
+        self.set_min_video_credits(10)
         first = await self.add_token(credits=2)
         second = await self.add_token(credits=0)
-        self.assertEqual(await self.selected_ids(for_video_generation=True), {first, second})
+        self.manager.ensure_valid_token = AsyncMock(side_effect=lambda token: token)
+        self.assertIsNone(await self.balancer.select_token(for_video_generation=True, track_pending=True))
+        reason = await self.balancer.get_unavailable_reason(for_video_generation=True)
+        self.assertIn("视频生成积分不足", reason)
+        self.assertIn("最低要求 10", reason)
+        self.assertEqual(self.manager.ensure_valid_token.await_count, 2)
+        self.assertEqual(self.balancer._video_pending, {})
+        self.assertTrue((await self.db.get_token(first)).is_active)
+        self.assertTrue((await self.db.get_token(second)).is_active)
+        self.assertEqual(await self.selected_ids(for_image_generation=True), {first, second})
+
+    async def test_validated_balance_replaces_cached_low_or_sufficient_balance(self):
+        self.set_min_video_credits(10)
+        token_id = await self.add_token(credits=2)
+        self.manager.ensure_valid_token = AsyncMock(side_effect=lambda token: token.model_copy(update={"credits": 50}))
+        selected = await self.balancer.select_token(for_video_generation=True)
+        self.assertEqual(selected.id, token_id)
+        self.assertEqual(selected.credits, 50)
+        await self.db.update_token(token_id, credits=500)
+        self.manager.ensure_valid_token.side_effect = lambda token: token.model_copy(update={"credits": 2})
+        self.assertIsNone(await self.balancer.select_token(for_video_generation=True))
+        self.assertIn("剩余 2", await self.balancer.get_unavailable_reason(for_video_generation=True))
+
+    async def test_unknown_validated_balance_remains_selectable(self):
+        self.set_min_video_credits(10)
+        token_id = await self.add_token(credits=0)
+        self.manager.ensure_valid_token = AsyncMock(side_effect=lambda token: token.model_copy(update={"credits": None}))
+        self.assertEqual((await self.balancer.select_token(for_video_generation=True)).id, token_id)
+
+    async def test_funded_cooldown_does_not_restore_underfunded_video_fallback(self):
+        self.set_min_video_credits(10)
+        poor, funded = await self.add_token(credits=2), await self.add_token(credits=500)
+        self.manager.ensure_valid_token = AsyncMock(side_effect=lambda token: token)
+        await self.balancer.record_generation_failure(
+            funded, unsubmitted_browser_error("native_generation_setup", "mode_failed"),
+            for_video_generation=True, token=await self.db.get_token(funded),
+        )
+        self.assertIsNone(await self.balancer.select_token(for_video_generation=True))
+        reason = await self.balancer.get_unavailable_reason(for_video_generation=True)
+        self.assertIn("mode_failed", reason)
+        self.assertIn("视频生成积分不足", reason)
+        self.manager.ensure_valid_token.assert_awaited_once()
+        self.assertEqual(self.manager.ensure_valid_token.await_args.args[0].id, poor)
+
+    async def test_typed_insufficient_credits_cools_only_model_and_balance_increase_restores_it(self):
+        token_id = await self.add_token(credits=4)
+        token = await self.db.get_token(token_id)
+        failure = unsubmitted_browser_error("native_submit_prepare", "insufficient_credits")
+        for delay in (900, 1800, 3600):
+            self.assertTrue(await self.balancer.record_generation_failure(
+                token_id, failure, for_video_generation=True, model="test-2k", token=token,
+            ))
+            reason = self.balancer.get_generation_cooldown_reason(token, for_video_generation=True, model="test-2k")
+            self.assertIn("insufficient_credits", reason)
+            self.assertIn(f"{delay} 秒", reason)
+        self.assertIsNone(self.balancer.get_generation_cooldown_reason(token, for_image_generation=True, model="test-2k"))
+        self.assertIsNone(self.balancer.get_generation_cooldown_reason(token, for_video_generation=True, model="another-2k"))
+        self.assertIsNone(await self.balancer.select_token(for_video_generation=True, model="test-2k"))
+        await self.db.update_token(token_id, credits=20)
+        restored = await self.balancer.select_token(for_video_generation=True, model="test-2k")
+        self.assertEqual(restored.id, token_id)
+        self.assertIsNone(self.balancer.get_generation_cooldown_reason(restored, for_video_generation=True, model="test-2k"))
+        self.assertTrue(restored.is_active)
 
     async def test_video_credit_floor_is_configurable_and_zero_disables_it(self):
         modest = await self.add_token(credits=50)

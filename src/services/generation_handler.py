@@ -1690,9 +1690,11 @@ class GenerationHandler:
         excluded = set()
         fallback = None
         attempt = 0
+        project_recovery_state = {"used": False}
         while True:
             attempt += 1
-            state = {"allow": attempt <= extra_attempts, "attempt": attempt, "fallback": fallback}
+            state = {"allow": attempt <= extra_attempts, "attempt": attempt, "fallback": fallback,
+                     "project_recovery": project_recovery_state}
             async with aclosing(self._generate_once(
                 model, prompt, images, stream, base_url_override, video_media_id,
                 client_submission_id, exclude_token_ids=excluded, retry_state=state,
@@ -1742,10 +1744,13 @@ class GenerationHandler:
         sent_callback_context = None
         sent_callback_bound = False
         rotation_error_marked = False
+        rotation_error_suppressed = False
         request_id = f"gen-{int(start_time * 1000)}-{id(asyncio.current_task())}"
 
         async def mark_rotation_error():
             nonlocal rotation_error_marked
+            if rotation_error_suppressed:
+                return
             if exit_rotation is not None and selected_token_id is not None and not rotation_error_marked:
                 rotation_error_marked = True
                 try:
@@ -2040,40 +2045,16 @@ class GenerationHandler:
 
             # 5. 根据类型处理
             generation_pipeline_started_at = time.time()
-            if generation_type == "image":
-                debug_logger.log_info(f"[GENERATION] 开始图片生成流程...")
-                async for chunk in self._handle_image_generation(
-                    token,
-                    project_id,
-                    model_config,
-                    prompt,
-                    images,
-                    stream,
-                    perf_trace=perf_trace,
-                    generation_result=generation_result,
-                    response_state=response_state,
-                    request_log_state=request_log_state,
-                    pending_token_state=pending_token_state,
-                ):
+            async with aclosing(self._generate_with_project_recovery(
+                token, project_id, model_config, prompt, images, stream,
+                generation_type=generation_type, perf_trace=perf_trace,
+                generation_result=generation_result, response_state=response_state,
+                request_log_state=request_log_state, pending_token_state=pending_token_state,
+                video_media_id=video_media_id,
+                recovery_state=(retry_state or {}).get("project_recovery"),
+            )) as chunks:
+                async for chunk in chunks:
                     yield chunk
-            else:  # video
-                debug_logger.log_info(f"[GENERATION] 开始视频生成流程...")
-                async with aclosing(self._handle_video_generation(
-                    token,
-                    project_id,
-                    model_config,
-                    prompt,
-                    images,
-                    stream,
-                    perf_trace=perf_trace,
-                    generation_result=generation_result,
-                    response_state=response_state,
-                    request_log_state=request_log_state,
-                    pending_token_state=pending_token_state,
-                    video_media_id=video_media_id,
-                )) as chunks:
-                    async for chunk in chunks:
-                        yield chunk
             perf_trace["generation_pipeline_ms"] = int(
                 (time.time() - generation_pipeline_started_at) * 1000
             )
@@ -2222,6 +2203,23 @@ class GenerationHandler:
             )
             raise
         except Exception as e:
+            # A different exit cannot repair a missing project, unavailable UI
+            # control or insufficient balance. Preserve the current route when
+            # the owned page proved that no generation was forwarded.
+            rotation_error_suppressed = (
+                isinstance(e, BrowserCaptchaError)
+                and e.submission_pending is False
+                and (
+                    e.reason in {
+                        "project_not_found", "insufficient_credits", "editor_missing",
+                        "flow_editor_unavailable", "prompt_input_mismatch",
+                        "prompt_changed_during_upload", "submit_control_missing",
+                        "submit_control_not_ready", "element_detached",
+                        "click_intercepted", "submit_disabled",
+                    }
+                    or e.stage == "native_generation_setup"
+                )
+            )
             await mark_rotation_error()
             error_msg = f"生成失败: {str(e)}"
             # Only the native runner's guarded request/cleanup evidence proves
@@ -2342,6 +2340,91 @@ class GenerationHandler:
                             finally:
                                 if account_generation_lease is not None:
                                     account_generation_lease.close()
+
+    async def _generate_with_project_recovery(
+        self, token, project_id, model_config, prompt, images, stream, *,
+        generation_type, perf_trace, generation_result, response_state,
+        request_log_state, pending_token_state, video_media_id=None, recovery_state=None,
+    ) -> AsyncGenerator:
+        """Replace one explicitly missing project only before any generation was sent."""
+        if recovery_state is None:
+            recovery_state = {"used": False}
+        recovery_trace = None
+        for project_attempt in range(2):
+            try:
+                pipeline = self._handle_image_generation if generation_type == "image" else self._handle_video_generation
+                options = {"video_media_id": video_media_id} if generation_type == "video" else {}
+                async with aclosing(pipeline(
+                    token, project_id, model_config, prompt, images, stream,
+                    perf_trace=perf_trace, generation_result=generation_result,
+                    response_state=response_state, request_log_state=request_log_state,
+                    pending_token_state=pending_token_state, **options,
+                )) as chunks:
+                    async for chunk in chunks:
+                        yield chunk
+                if recovery_trace is not None:
+                    recovery_trace["status"] = "succeeded" if generation_result.get("success") else "retry_failed"
+                return
+            except BrowserCaptchaError as failure:
+                if recovery_trace is not None:
+                    recovery_trace["status"] = "retry_failed"
+                recover = getattr(self.token_manager, "recover_missing_project", None)
+                if (
+                    project_attempt or recovery_state.get("used") or not callable(recover)
+                    or failure.reason != "project_not_found" or failure.submission_pending is not False
+                    or getattr(failure, "submission_uncertain", False)
+                    or getattr(failure, "outcome_unknown", False)
+                    or getattr(failure, "upstream_accepted", None) is True
+                    or generation_result.get("success") or generation_result.get("error_emitted")
+                    or generation_result.get("submission_pending") or generation_result.get("usage_recorded")
+                    or generation_result.get("upstream_accepted") is True
+                    or generation_result.get("submitted_video") is not None
+                    or response_state.get("url") or response_state.get("generated_assets")
+                ):
+                    raise
+                submission_id = (request_log_state or {}).get("client_submission_id")
+                if submission_id:
+                    receipt = await SubmissionLedger(self.db).get(submission_id)
+                    if receipt and (
+                        receipt.get("operation_id") or receipt.get("operations")
+                        or receipt.get("state") in {"confirmed", "failed"}
+                    ):
+                        raise
+                recovery_state["used"] = True
+                recovery_trace = {"attempts": 1, "status": "preparing"}
+                perf_trace["project_recovery"] = recovery_trace
+                recovery_started_at = time.monotonic()
+                debug_logger.log_info(f"[GENERATION] Token {token.id} 项目已失效，确认未提交生成，正在更换项目")
+                await self._update_request_log_progress(
+                    request_log_state, token_id=token.id, status_text="recovering_project", progress=22,
+                )
+                if stream:
+                    yield self._create_stream_chunk("当前项目已失效，正在更换项目后重试一次...\n")
+                try:
+                    replacement = await recover(token.id, project_id)
+                    if not replacement or replacement == project_id:
+                        raise ValueError("Missing project was not replaced")
+                    project_id = replacement
+                    await self.flow_client.prefill_remote_browser_pool(
+                        project_id=project_id,
+                        action="IMAGE_GENERATION" if generation_type == "image" else "VIDEO_GENERATION",
+                        token_id=token.id,
+                    )
+                except Exception:
+                    # Keep the original explicit non-submission evidence; a
+                    # repair/control-plane failure is not a new generation.
+                    recovery_trace["status"] = "failed"
+                    raise failure from None
+                finally:
+                    recovery_trace["prepare_ms"] = int((time.monotonic() - recovery_started_at) * 1000)
+                await self._update_request_log_progress(
+                    request_log_state, token_id=token.id, status_text="project_ready", progress=22,
+                    response_extra={"project_id": project_id, "project_recovered": True},
+                )
+            except Exception:
+                if recovery_trace is not None:
+                    recovery_trace["status"] = "retry_failed"
+                raise
 
     def _get_no_token_error_message(self, generation_type: str) -> str:
         """获取无可用Token时的详细错误信息"""

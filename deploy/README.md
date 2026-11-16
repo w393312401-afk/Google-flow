@@ -9,9 +9,11 @@ https://flow2api.wushi-api.com
   → http://127.0.0.1:38000（现有 Flow2API）
 ```
 
-OpenAI 兼容 Base URL 为 `https://flow2api.wushi-api.com/v1`，Gemini Base URL 为 `https://flow2api.wushi-api.com/v1beta`。公网管理员密码和 API Key 独立于本机凭据，保存在 `/Users/fly/Library/Application Support/Flow2API/public-access/credentials.txt`；配置保存在同目录 `config.json`。目录权限为 0700，凭据文件为 0600，不进入 Git。
+OpenAI 兼容 Base URL 为 `https://flow2api.wushi-api.com/v1`，Gemini Base URL 为 `https://flow2api.wushi-api.com/v1beta`。公网管理员账号密码与本机管理页的安全配置一致：`config.json` 中设置 `admin_auth_mode="local"`，网关在每次登录时读取本地 SQLite 当前生效的账号密码，本机后续修改后公网自动跟随。该模式的 `admin_username`、`admin_password` 留空，不保存另一套公网管理员密码。未设置此模式时仍使用原独立认证模式。
 
-网关验证公网 API Key 后读取 SQLite 中现有 API Key并转发，公网管理员登录同样使用独立强密码。原服务和 SPARK 的本机配置保持不变。公网后台显示的是公网 API Key；修改管理员密码、API Key 和缓存基础地址的操作在公网入口被禁止，需要在本机维护。
+公网 API Key 继续独立于本机 API Key，保存在 `/Users/fly/Library/Application Support/Flow2API/public-access/credentials.txt`；网关配置保存在同目录 `config.json`。目录权限为 0700，凭据文件为 0600，不进入 Git。凭据文件中的管理员账号密码是更新时的快照，以本机安全配置的当前值为准。
+
+网关验证公网 API Key 后读取 SQLite 中现有 API Key 并转发，公网管理员登录使用本机当前账号密码。原服务和 SPARK 的本机配置保持不变。公网后台显示的是公网 API Key；修改管理员密码、API Key 和缓存基础地址的操作在公网入口被禁止，需要在本机维护。
 
 网关使用固定的 HTTPS 主机头生成公网媒体链接，保持原服务 `cache_base_url` 为空，避免影响 SPARK 的本机媒体下载。缓存媒体链接沿用原服务的访问方式：持有文件链接即可访问，按原缓存期限过期。公网不提供 `/metrics`、`/captcha_ws` 和自动 API 文档；健康检查只返回服务是否在线。
 

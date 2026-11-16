@@ -109,15 +109,17 @@ class FrontendCookieTokenRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.manager._get_credits_for_token = AsyncMock(return_value={"credits": 42})
         self.manager._refresh_at = AsyncMock(return_value=False)
         self.manager.db.get_token.return_value = token
+        self.manager.db.commit_token_health_result.return_value = True
 
         self.assertIs(await self.manager.ensure_valid_token(token), token)
         self.assertIs(await self.manager.ensure_valid_token(token), token)
 
         self.manager._get_credits_for_token.assert_awaited_once_with(token, token.at)
         self.manager._refresh_at.assert_not_awaited()
-        self.manager.db.update_token.assert_awaited_once_with(
-            token.id, credits=42, user_paygate_tier=None
+        self.manager.db.commit_token_health_result.assert_awaited_once_with(
+            token, reason=None, updates={"credits": 42, "user_paygate_tier": None},
         )
+        self.manager.db.update_token.assert_not_awaited()
 
     def test_frontend_refresh_window_boundaries_and_expiration(self):
         for seconds, expected in [(301, False), (300, False), (299, True),

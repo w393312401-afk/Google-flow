@@ -17,7 +17,7 @@ from src.services.load_balancer import LoadBalancer
 class PendingSelectionTests(unittest.IsolatedAsyncioTestCase):
     async def make_balancer(self, count=5):
         tokens = [Token(id=index, st="synthetic", email="synthetic@example.com", image_concurrency=1,
-                        video_concurrency=1) for index in range(1, count + 1)]
+                        video_concurrency=1, credits=500) for index in range(1, count + 1)]
         concurrency = ConcurrencyManager()
         await concurrency.initialize(tokens)
         manager = SimpleNamespace(

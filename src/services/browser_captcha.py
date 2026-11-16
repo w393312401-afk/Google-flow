@@ -24,7 +24,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple, Union
 from datetime import datetime
-from urllib.parse import urlparse, parse_qsl
+from urllib.parse import urlparse, parse_qs, parse_qsl
 
 from ..core.logger import debug_logger
 from ..core.browser_runtime_status import (
@@ -585,6 +585,7 @@ class TokenBrowser:
         for key in (
             "editor_present", "editor_visible", "submit_present", "submit_disabled",
             "captcha_ready", "overlay_count", "login_link", "cookie_count",
+            "project_not_found",
             "has_flow_session", "has_google_account", "proxy_active", "custom_executable",
             "bootstrap_attempts",
         ):
@@ -644,6 +645,8 @@ class TokenBrowser:
                     ready_state: document.readyState,
                     editor_present: !!editor,
                     editor_visible: !!editor && !!(editor.offsetWidth || editor.offsetHeight || editor.getClientRects().length),
+                    project_not_found: host === 'flow.google.com' && !editor && (document.body?.innerText || '')
+                        .split(String.fromCharCode(10)).some(line => /^Project not found[.]?$/i.test(line.trim())),
                     submit_present: !!submit,
                     submit_disabled: !!submit && !!submit.disabled,
                     captcha_ready: !!window.grecaptcha?.enterprise,
@@ -671,6 +674,8 @@ class TokenBrowser:
             raise self._captcha_failure("login_required") from None
         if state.get("location") == "flow_landing":
             raise self._captcha_failure("flow_editor_unavailable") from None
+        if state.get("project_not_found"):
+            raise self._captcha_failure("project_not_found") from None
         if wait_error is not None:
             reason = self._classify_captcha_error(wait_error)
             raise self._captcha_failure("editor_missing" if reason == "timeout" else reason) from None
@@ -1811,6 +1816,9 @@ class TokenBrowser:
             raise self._captcha_failure("login_required")
         if state.get("location") == "flow_landing":
             raise self._captcha_failure("flow_editor_unavailable")
+        if state.get("project_not_found"):
+            await self._save_editor_failure_evidence(page, "project_not_found")
+            raise self._captcha_failure("project_not_found")
 
         # DOMContentLoaded and readyState=complete do not prove that the Flow
         # application has rendered. Wait for the actual input used by submit,

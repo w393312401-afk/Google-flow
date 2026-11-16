@@ -3,10 +3,13 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, PropertyMock, patch
 
+from src.core.config import config
+from src.core.account_operation_context import account_error_reason
 from src.core.database import Database
 from src.core.models import Token
+from src.services.captcha_errors import BrowserCaptchaError
 from src.services.flow_client import FlowClient
 from src.services.token_manager import TokenManager
 
@@ -126,6 +129,267 @@ class TokenHealthTests(unittest.IsolatedAsyncioTestCase):
         self.protocol_login.assert_not_awaited()
         metric.assert_called_once_with("at", "failure")
 
+    def test_structured_http_status_overrides_untrusted_exception_text(self):
+        for field in ("status_code", "response"):
+            for status in (401, 403, 500, 503):
+                with self.subTest(field=field, status=status):
+                    failure = RuntimeError("UNAUTHENTICATED HTTP 401 secret-cookie private upstream body")
+                    setattr(failure, field, status if field == "status_code" else SimpleNamespace(status_code=status))
+                    reason = self.manager._safe_health_error("AT_REFRESH", failure)
+                    if status == 401:
+                        self.assertEqual(reason, "AT_REFRESH: credentials rejected (UNAUTHENTICATED)")
+                    else:
+                        self.assertEqual(reason, f"AT_REFRESH: upstream unavailable (HTTP {status})")
+                    self.assertEqual(self.manager._is_authentication_failure(failure), status == 401)
+                    self.assertNotIn("secret", reason)
+                    self.assertNotIn("private", reason)
+
+    def test_fixed_transport_and_browser_recovery_failures_are_never_unclassified(self):
+        fixed_transport = self.manager._safe_health_error(
+            "AT_REFRESH", RuntimeError("Flow API text request failed: request failed")
+        )
+        self.assertEqual(fixed_transport, "AT_REFRESH: upstream transport unavailable")
+        self.assertEqual(account_error_reason(fixed_transport), "upstream_unavailable")
+
+        cases = (
+            (BrowserCaptchaError("navigation", "proxy_connection_failed"),
+             "ST_REFRESH: network or proxy unavailable"),
+            (BrowserCaptchaError("cookie_binding", "login_credentials_missing"),
+             "ST_REFRESH: credential recovery required"),
+            (BrowserCaptchaError("browser_acquisition", "browser_closed"),
+             "ST_REFRESH: credential recovery unavailable"),
+            (RuntimeError("账号浏览器标签页不可用"),
+             "ST_REFRESH: credential recovery unavailable"),
+            (RuntimeError("Flow 页面未返回已登录账号，请重新同步 Google Cookies"),
+             "ST_REFRESH: credential recovery required"),
+        )
+        for failure, expected in cases:
+            with self.subTest(failure=type(failure).__name__, expected=expected):
+                reason = self.manager._safe_health_error("ST_REFRESH", failure)
+                self.assertEqual(reason, expected)
+                self.assertNotIn("unclassified", reason)
+
+    async def test_auth_root_survives_network_failure_during_recovery(self):
+        self.flow._current_rpc.side_effect = RuntimeError(AUTH_ERROR)
+        self.protocol_login.return_value = {
+            "success": False,
+            "error": "Flow API text request failed: connection unavailable",
+        }
+
+        self.assertFalse(await self.manager._refresh_at(self.token_id))
+
+        final_reason = self.manager.get_last_validation_error(self.token_id)
+        self.assertEqual(final_reason, "AT_REFRESH: credential recovery required")
+        self.assertEqual(self.manager._last_at_refresh_error[self.token_id], final_reason)
+        self.assertEqual(
+            self.manager._last_st_refresh_error[self.token_id],
+            "ST_REFRESH: network or proxy unavailable",
+        )
+        self.assertEqual(account_error_reason(final_reason), "credential_recovery_required")
+        self.assertNotIn("network or proxy", final_reason)
+        self.assertTrue((await self.token()).is_active)
+        self.assertEqual(self.manager.get_validation_cooldown_reason(await self.token()), final_reason)
+
+    async def test_google_login_redirect_reaches_recovery_without_unclassified_error(self):
+        # Exercise the real frontend transport, current RPC and TokenManager;
+        # only the HTTP session and protocol login boundary are replaced.
+        del self.flow._current_rpc
+        session = AsyncMock()
+        session.__aenter__.return_value = session
+        session.get.return_value = SimpleNamespace(
+            status_code=200,
+            url="https://accounts.google.com/v3/signin/identifier?continue=test-secret-url",
+            text="test-secret-login-page",
+        )
+        self.protocol_login.return_value = {"success": False, "error": "HTTP 503 test-secret"}
+        with patch("src.services.flow_frontend.AsyncSession", return_value=session):
+            self.assertFalse(await self.manager._refresh_at(self.token_id))
+        self.assertEqual(self.manager.get_last_validation_error(self.token_id),
+                         "AT_REFRESH: credential recovery required")
+        self.protocol_login.assert_awaited_once()
+        session.get.assert_awaited_once()
+        await self.assert_unavailable_and_active()
+        audit = await self.db.get_account_operation_logs(token_id=self.token_id, page_size=100)
+        self.assertNotIn("test-secret", str(audit))
+        self.assertTrue(any(row["details"].get("auth_evidence") == "login_redirect"
+                            for row in audit["items"]))
+
+    async def test_at_check_auth_root_survives_refresh_transport_failure_and_cools_down(self):
+        for failure in (TimeoutError(), RuntimeError("HTTP 503 private-response"), RuntimeError(TRAFFIC_ERROR)):
+            with self.subTest(failure=type(failure).__name__, message=str(failure)):
+                self.monotonic.return_value += 3600
+                self.flow._current_rpc.reset_mock()
+                self.flow._current_rpc.side_effect = [RuntimeError(AUTH_ERROR), failure]
+                self.assertIsNone(await self.manager.ensure_valid_token(await self.token()))
+                final_reason = "AT_REFRESH: credential recovery required"
+                self.assertEqual(self.manager.get_last_validation_error(self.token_id), final_reason)
+                self.assertEqual(self.manager.get_validation_cooldown_reason(await self.token()), final_reason)
+                # Queued requests must not retry the broken recovery transport.
+                self.assertIsNone(await self.manager.ensure_valid_token(await self.token()))
+                self.assertEqual(self.flow._current_rpc.await_count, 2)
+                self.protocol_login.assert_not_awaited()
+                await self.assert_unavailable_and_active()
+                audit = await self.db.get_account_operation_logs(
+                    token_id=self.token_id, operation="health_check", page_size=100,
+                )
+                failures = {row["reason"] for row in audit["items"] if row["status"] == "failed"}
+                self.assertIn("credentials_rejected", failures)
+                self.assertIn("credential_recovery_required", failures)
+                self.assertNotIn("private-response", str(audit))
+
+    async def test_replaced_credentials_do_not_inherit_previous_at_check_auth_root(self):
+        calls = 0
+
+        async def refresh_with_replaced_cookie(**kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError(AUTH_ERROR)
+            await self.db.update_token(self.token_id, google_cookies="OSID=new-session; SID=new-account")
+            raise TimeoutError()
+
+        self.flow._current_rpc.side_effect = refresh_with_replaced_cookie
+        self.assertIsNone(await self.manager.ensure_valid_token(await self.token()))
+        outcome = self.manager.consume_validation_outcome(self.token_id)
+        self.assertEqual(outcome.reason, "AT_REFRESH: network or proxy unavailable")
+        self.assertNotEqual(outcome.identity, self.manager.health_identity(await self.token()))
+        self.assertIsNone(self.manager.get_validation_cooldown_reason(await self.token()))
+        self.assertTrue((await self.token()).is_active)
+
+    async def test_prior_attempt_auth_error_does_not_taint_new_transport_failure(self):
+        await self.db.update_token(self.token_id, at_expires=datetime.now(timezone.utc))
+        self.manager._last_at_refresh_error[self.token_id] = "AT_CHECK: credentials rejected (UNAUTHENTICATED)"
+        self.flow._current_rpc.side_effect = TimeoutError()
+        self.assertIsNone(await self.manager.ensure_valid_token(await self.token()))
+        self.assertEqual(self.manager.get_last_validation_error(self.token_id),
+                         "AT_REFRESH: network or proxy unavailable")
+        self.assertTrue((await self.token()).is_active)
+
+    async def test_periodic_protocol_auth_root_survives_browser_transport_failure(self):
+        await self.db.update_token(self.token_id, auto_refresh_enabled=True)
+        self.protocol_login.return_value = {"success": False, "error": AUTH_ERROR}
+        browser = SimpleNamespace(refresh_google_cookies=AsyncMock(
+            side_effect=BrowserCaptchaError("navigation", "proxy_connection_failed"),
+        ))
+        browser_module = SimpleNamespace(BrowserCaptchaService=SimpleNamespace(
+            get_instance=AsyncMock(return_value=browser),
+        ))
+        with patch.object(type(config), "captcha_method", new_callable=PropertyMock, return_value="browser"), \
+             patch.dict("sys.modules", {"src.services.browser_captcha": browser_module}):
+            await self.manager._refresh_protocol_token(await self.token(), datetime.now(timezone.utc))
+        reason = "ST_REFRESH: credential recovery required"
+        # The rejected page/browser renewal keeps its own root cause, while a
+        # separately successful current RPC proves this AT remains usable.
+        self.assertIsNone(self.manager.get_last_validation_error(self.token_id))
+        self.assertEqual(self.manager._last_st_refresh_error[self.token_id], reason)
+        self.assertEqual((await self.token()).last_st_refresh_result, reason)
+        self.protocol_login.assert_awaited_once()
+        browser.refresh_google_cookies.assert_awaited_once()
+        self.flow._current_rpc.assert_awaited_once()
+        self.assertIsNotNone(await self.manager.ensure_valid_token(await self.token()))
+        audit = await self.db.get_account_operation_logs(
+            token_id=self.token_id, operation="refresh_st", page_size=100,
+        )
+        failed = {(row["stage"], row["reason"]) for row in audit["items"] if row["status"] == "failed"}
+        self.assertIn(("page_probe", "credentials_rejected"), failed)
+        self.assertIn(("ST_REFRESH", "network_or_proxy_unavailable"), failed)
+
+    async def test_periodic_protocol_403_with_browser_timeout_does_not_claim_auth_rejection(self):
+        await self.db.update_token(self.token_id, auto_refresh_enabled=True)
+        self.protocol_login.return_value = {"success": False, "error": "HTTP 403"}
+        browser = SimpleNamespace(refresh_google_cookies=AsyncMock(side_effect=TimeoutError()))
+        browser_module = SimpleNamespace(BrowserCaptchaService=SimpleNamespace(
+            get_instance=AsyncMock(return_value=browser),
+        ))
+        with patch.object(type(config), "captcha_method", new_callable=PropertyMock, return_value="browser"), \
+             patch.dict("sys.modules", {"src.services.browser_captcha": browser_module}):
+            await self.manager._refresh_protocol_token(await self.token(), datetime.now(timezone.utc))
+        self.assertEqual((await self.token()).last_st_refresh_result,
+                         "ST_REFRESH: network or proxy unavailable")
+        self.assertIsNone(self.manager.get_last_validation_error(self.token_id))
+        self.flow._current_rpc.assert_awaited_once()
+        self.assertIsNotNone(await self.manager.ensure_valid_token(await self.token()))
+
+    async def test_empty_network_exceptions_keep_account_active_without_committing_credentials(self):
+        original = (await self.token()).model_dump()
+        for failure in (TimeoutError(), ConnectionError()):
+            with self.subTest(error_type=type(failure).__name__):
+                self.flow._current_rpc.side_effect = failure
+                self.assertFalse(await self.manager._refresh_at(self.token_id))
+                self.assertEqual(self.manager.get_last_validation_error(self.token_id),
+                                 "AT_REFRESH: network or proxy unavailable")
+                await self.assert_unavailable_and_active()
+                self.assertEqual((await self.token()).model_dump(), original)
+        self.protocol_login.assert_not_awaited()
+
+    async def test_exact_invalid_balance_responses_keep_fixed_safe_reason_and_backoff(self):
+        original = (await self.token()).model_dump()
+        for message in ("Flow frontend RPC returned no payload: rpc=nzlxg", "Flow credits RPC response invalid"):
+            with self.subTest(message=message):
+                self.monotonic.return_value += 3600
+                self.flow._current_rpc.side_effect = RuntimeError(message)
+                calls_before = self.flow._current_rpc.await_count
+                for _ in range(2):
+                    self.assertIsNone(await self.manager.ensure_valid_token(await self.token()))
+                self.assertEqual(self.manager.get_last_validation_error(self.token_id),
+                                 "AT_CHECK: upstream validation response invalid")
+                self.assertEqual(self.flow._current_rpc.await_count, calls_before + 1)
+                self.assertEqual((await self.token()).model_dump(), original)
+                await self.assert_unavailable_and_active()
+                audit = await self.db.get_account_operation_logs(
+                    token_id=self.token_id, operation="health_check", page_size=100,
+                )
+                latest = audit["items"][:2]
+                self.assertEqual(
+                    {(row["status"], row["reason"]) for row in latest},
+                    {("failed", "upstream_unavailable"), ("cooldown", "validation_backoff")},
+                )
+                cooldown = next(row for row in latest if row["status"] == "cooldown")
+                self.assertEqual(cooldown["details"]["retry_reason"], "upstream_unavailable")
+        self.protocol_login.assert_not_awaited()
+        other_rpc = self.manager._safe_health_error("AT_REFRESH", RuntimeError(
+            "Flow frontend RPC returned no payload: rpc=jHPbke"))
+        self.assertIn("unclassified error", other_rpc)
+
+    async def test_frontend_refresh_reuses_one_real_balance_validation_including_zero(self):
+        for balance in (0, 123):
+            with self.subTest(balance=balance):
+                self.flow._current_rpc.return_value = [balance]
+                self.flow._current_rpc.reset_mock()
+                self.assertTrue(await self.manager._refresh_at(self.token_id))
+                self.flow._current_rpc.assert_awaited_once()
+                token = await self.token()
+                self.assertEqual(token.at, FlowClient.FRONTEND_ACCESS_TOKEN)
+                self.assertEqual(token.credits, balance)
+                self.assertEqual(token.user_paygate_tier,
+                                 "PAYGATE_TIER_ONE" if balance else "PAYGATE_TIER_NOT_PAID")
+                self.assertTrue(self.manager._has_recent_at_validation(self.token_id))
+
+    async def test_missing_or_invalid_frontend_balance_and_legacy_at_still_require_verification(self):
+        cases = [
+            {"access_token": FlowClient.FRONTEND_ACCESS_TOKEN},
+            *({"access_token": FlowClient.FRONTEND_ACCESS_TOKEN, "credits": balance}
+              for balance in (None, True, -1, "123", float("nan"), float("inf"))),
+            {"access_token": "legacy-candidate", "credits": 999},
+        ]
+        for result in cases:
+            with self.subTest(result=result):
+                self.flow.st_to_at = AsyncMock(return_value=result)
+                self.flow._current_rpc.reset_mock()
+                self.assertTrue(await self.manager._refresh_at(self.token_id))
+                self.flow._current_rpc.assert_awaited_once()
+                self.assertEqual((await self.token()).credits, 123)
+
+    async def test_invalid_frontend_credit_response_cannot_update_expiry_or_balance(self):
+        original = (await self.token()).model_dump()
+        self.flow._current_rpc.return_value = []
+        self.assertFalse(await self.manager._refresh_at(self.token_id))
+        self.assertEqual(self.manager.get_last_validation_error(self.token_id),
+                         "AT_REFRESH: upstream validation response invalid")
+        self.assertEqual((await self.token()).model_dump(), original)
+        await self.assert_unavailable_and_active()
+        self.flow._current_rpc.assert_awaited_once()
+
     async def test_cold_start_auth_failure_recovers_and_caches_success(self):
         self.flow._current_rpc.side_effect = [
             RuntimeError(AUTH_ERROR),
@@ -198,7 +462,11 @@ class TokenHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.manager.ensure_valid_token(await self.token()))
         self.protocol_login.assert_awaited_once()
         await self.assert_unavailable_and_active()
-        self.assertIn("traffic restriction", self.manager.get_last_validation_error(self.token_id))
+        self.assertEqual(
+            self.manager.get_last_validation_error(self.token_id),
+            "AT_REFRESH: credential recovery required",
+        )
+        self.assertIn("traffic restriction", self.manager._last_st_refresh_error[self.token_id])
 
     async def test_temporary_protocol_failure_cools_down_same_cookie(self):
         self.flow._current_rpc.side_effect = RuntimeError(AUTH_ERROR)
@@ -211,6 +479,10 @@ class TokenHealthTests(unittest.IsolatedAsyncioTestCase):
         await self.assert_unavailable_and_active()
         self.assertEqual(
             self.manager.get_last_validation_error(self.token_id),
+            "AT_REFRESH: credential recovery required",
+        )
+        self.assertEqual(
+            self.manager._last_st_refresh_error[self.token_id],
             "ST_REFRESH: upstream unavailable (HTTP 503)",
         )
         self.assertNotIn("secret", (await self.token()).last_st_refresh_result)
@@ -307,8 +579,10 @@ class TokenHealthTests(unittest.IsolatedAsyncioTestCase):
 
         self.flow._current_rpc.side_effect = validate_old_cookie
         returned = await self.manager.ensure_valid_token(await self.token())
+        self.assertIsNone(returned)
+        current = await self.token()
         self.assertFalse(self.manager._has_recent_at_validation(
-            self.token_id, proxy_url=returned.proxy_url, token=returned,
+            self.token_id, proxy_url=current.proxy_url, token=current,
         ))
         self.flow._current_rpc.side_effect = None
         self.assertIsNotNone(await self.manager.ensure_valid_token(await self.token()))

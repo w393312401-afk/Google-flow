@@ -50,6 +50,34 @@ class AccountAdmissionTests(unittest.TestCase):
             self.assert_busy(lambda: self.admission.maintenance(7), "already_running")
         self.assertFalse(self.admission.maintenance_active(7))
 
+    def test_existing_maintenance_lease_can_be_delegated_without_relocking(self):
+        with self.admission.maintenance(7) as lease:
+            self.admission.validate_maintenance_lease(lease, 7)
+            self.assert_busy(lambda: self.admission.generation(7))
+        with self.admission.generation(7):
+            pass
+
+    def test_delegation_rejects_wrong_account_closed_owner_and_non_owner(self):
+        with self.admission.maintenance(7) as lease:
+            self.assert_busy(lambda: self.admission.validate_maintenance_lease(lease, 8))
+            other = AccountAdmission(self.root / "other.db")
+            self.assert_busy(lambda: other.validate_maintenance_lease(lease, 7))
+            with self.admission.worker(7, lease.capability) as worker:
+                self.assert_busy(lambda: self.admission.validate_maintenance_lease(worker, 7))
+        self.assert_busy(lambda: self.admission.validate_maintenance_lease(lease, 7))
+        with self.admission.generation(7) as generation:
+            self.assert_busy(lambda: self.admission.validate_maintenance_lease(generation, 7))
+
+    def test_delegation_rejects_an_unlocked_or_replaced_owner(self):
+        import fcntl
+
+        with self.admission.maintenance(7) as lease:
+            fcntl.flock(lease.fd, fcntl.LOCK_UN)
+            self.assert_busy(lambda: self.admission.validate_maintenance_lease(lease, 7))
+        with self.admission.maintenance(7) as lease:
+            (self.admission.directory / "7.owner.lock").unlink()
+            self.assert_busy(lambda: self.admission.validate_maintenance_lease(lease, 7))
+
     def test_host_return_to_sync_commit_gap_keeps_owner_lock(self):
         with self.admission.maintenance(7) as parent:
             with self.admission.worker(7, parent.capability):

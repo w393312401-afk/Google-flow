@@ -48,10 +48,14 @@ def make_route(body=None, url=RPC_URL, response_text="native-response", method="
 
 
 class FakeLocator:
-    def __init__(self, page, editor):
+    def __init__(self, page, editor, credit_warning=False):
         self.page = page
         self.editor = editor
+        self.credit_warning = credit_warning
         self.first = self
+
+    async def is_visible(self):
+        return self.page.insufficient_credits if self.credit_warning else True
 
     async def wait_for(self, **kwargs):
         if not self.editor and self.page.submit_missing:
@@ -90,6 +94,7 @@ class FakePage:
         self.closed = False
         self.submit_missing = False
         self.submit_blocked = False
+        self.insufficient_credits = False
         self.close = AsyncMock(side_effect=self._close)
         self.route = AsyncMock(side_effect=self._route)
         self.unroute = AsyncMock(side_effect=self._unroute)
@@ -110,7 +115,8 @@ class FakePage:
         self.events.append("close")
 
     def locator(self, selector):
-        return FakeLocator(self, editor="ProseMirror" in selector)
+        return FakeLocator(self, editor="ProseMirror" in selector,
+                           credit_warning="Insufficient credits warning" in selector)
 
     async def dispatch(self, route):
         await self.handlers[-1][1](route)
@@ -249,6 +255,39 @@ class NativeImageSubmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(failure.exception.submission_pending, False)
         self.assertNotIn("click", self.page.events)
         self.assertTrue(self.page.closed)
+
+    async def test_insufficient_credits_stops_before_prompt_or_upload_without_arming(self):
+        self.page.insufficient_credits = True
+        native = make_route()
+        self.dispatch_on_submit(native)
+        self.page.on_close = lambda: self.page.dispatch(native)
+        with self.assertRaises(BrowserCaptchaError) as raised:
+            await self.submit()
+        failure = raised.exception
+        self.assertEqual((failure.stage, failure.reason), ("native_submit_prepare", "insufficient_credits"))
+        self.assertIs(failure.submission_pending, False)
+        self.assertNotIn("fill", self.page.events)
+        self.page.on_submit.assert_not_awaited()
+        native.continue_.assert_not_awaited()
+        native.abort.assert_awaited_once()
+        self.assertFalse(failure.native_submission_diagnostic["armed"])
+        self.assertFalse(failure.native_submission_diagnostic["request_forwarded"])
+        self.assertTrue(failure.native_submission_diagnostic["submit_control_state"]["insufficient_credits"])
+        self.assertTrue(self.page.closed)
+
+    async def test_credit_warning_appearing_after_prompt_is_caught_by_final_preflight(self):
+        async def read_prompt(editor):
+            self.page.insufficient_credits = True
+            return self.spec["prompt"]
+
+        with patch("src.services.native_image_submission.read_native_prompt", side_effect=read_prompt):
+            with self.assertRaises(BrowserCaptchaError) as raised:
+                await self.submit()
+        self.assertEqual(raised.exception.reason, "insufficient_credits")
+        self.assertIn("fill", self.page.events)
+        self.assertNotIn("click", self.page.events)
+        self.assertIs(raised.exception.submission_pending, False)
+        self.assertFalse(raised.exception.native_submission_diagnostic["armed"])
 
     async def test_disabled_or_obscured_submit_never_arms_or_sends_generation(self):
         self.page.submit_blocked = True

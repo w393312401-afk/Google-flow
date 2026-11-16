@@ -1,6 +1,6 @@
 """Exercise audited admin handlers and token lifecycle with isolated real storage."""
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import sqlite3
@@ -342,7 +342,8 @@ class AccountOperationIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "success": True, "google_cookies": "OSID=SECRET_NEW_OSID; SID=SECRET_NEW_SID",
             "email": "integrated@example.test"})), \
              patch.object(self.manager, "_st_to_at_for_token", AsyncMock(return_value={
-                 "access_token": "SECRET_PROTOCOL_AT", "credits": 90})):
+                 "access_token": "SECRET_PROTOCOL_AT", "credits": 90,
+                 "expires": (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()})):
             await self.manager.run_protocol_refresh_once()
             count = len(await self.rows())
             await self.manager.run_protocol_refresh_once()

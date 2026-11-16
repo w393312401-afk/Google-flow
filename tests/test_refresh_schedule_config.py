@@ -52,6 +52,7 @@ class RefreshScheduleConfigTests(unittest.IsolatedAsyncioTestCase):
 
     async def add_token(self, label, **overrides):
         fields = {"st": f"SECRET_ST_{label}", "at": f"SECRET_AT_{label}",
+                  "at_expires": datetime.now(timezone.utc) + timedelta(hours=2),
                   "email": f"{label}@example.test", "login_account": f"{label}@example.test",
                   "google_cookies": f"SID=SECRET_COOKIE_{label}", "login_password": "SECRET_PASSWORD",
                   "proxy_url": "http://user:SECRET_PROXY@private.example:8080",
